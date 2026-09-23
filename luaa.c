@@ -65,6 +65,11 @@
 #include "xkb.h"
 #include "xrdb.h"
 
+/* LGI shim: statically linked Pango/PangoCairo binding, see
+ * lib/vendor/lgishim_pango.c and lib/vendor/lgishim.lua. */
+extern int luaopen_lgishim_pango(lua_State *L);
+extern int luaopen_lgishim_pangocairo(lua_State *L);
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -1127,6 +1132,17 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
     luaL_openlibs(L);
 
     luaA_fixups(L);
+
+    /* Register the LGI shim so require("lgishim_pango") resolves without
+     * dlopen(). lib/vendor/lgishim.lua falls back to real lgi when this
+     * entry is absent, i.e. in a normal dynamically linked build. */
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "preload");
+    lua_pushcfunction(L, luaopen_lgishim_pango);
+    lua_setfield(L, -2, "lgishim_pango");
+    lua_pushcfunction(L, luaopen_lgishim_pangocairo);
+    lua_setfield(L, -2, "lgishim_pangocairo");
+    lua_pop(L, 2);
 
     luaA_object_setup(L);
 
