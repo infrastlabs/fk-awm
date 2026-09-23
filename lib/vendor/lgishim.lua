@@ -19,16 +19,18 @@ local ok, Pango = pcall(require, "lgishim_pango")
 
 if ok and type(Pango) == "table" then
     local ok2, PangoCairo = pcall(require, "lgishim_pangocairo")
+    local ok3, Cairo = pcall(require, "lgishim_cairo")
     M = {
         shim = true,
         Pango = Pango,
         PangoCairo = ok2 and PangoCairo or {},
+        Cairo = ok3 and Cairo or {},
         GLib = {},
         Gio = {},
-        cairo = {},
         Rsvg = {},
         GObject = {},
     }
+    M.cairo = M.Cairo  -- lowercase alias for the codebase's lgi.cairo usage
 else
     M = require("lgi")
     M.shim = false
