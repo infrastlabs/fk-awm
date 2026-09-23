@@ -129,6 +129,7 @@ if(AWESOME_LGISHIM)
     include(FindPkgConfig)
     pkg_check_modules(LGISHIM_PANGO_REQUIRED pango pangocairo)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pango.c)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_cairo.c)
     # include_directories() was already called above (before this option block
     # ran), so appending to AWESOME_REQUIRED_INCLUDE_DIRS here would be a no-op.
     # Re-invoking include_directories() is cumulative for every target added
