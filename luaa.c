@@ -69,6 +69,7 @@
  * lib/vendor/lgishim_pango.c and lib/vendor/lgishim.lua. */
 extern int luaopen_lgishim_pango(lua_State *L);
 extern int luaopen_lgishim_pangocairo(lua_State *L);
+extern int luaopen_lgishim_cairo(lua_State *L);
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -1142,6 +1143,8 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
     lua_setfield(L, -2, "lgishim_pango");
     lua_pushcfunction(L, luaopen_lgishim_pangocairo);
     lua_setfield(L, -2, "lgishim_pangocairo");
+    lua_pushcfunction(L, luaopen_lgishim_cairo);
+    lua_setfield(L, -2, "lgishim_cairo");
     lua_pop(L, 2);
 
     luaA_object_setup(L);
