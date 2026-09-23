@@ -97,6 +97,55 @@ set(AWE_SRCS
     ${BUILD_DIR}/objects/selection_getter.c
     ${BUILD_DIR}/objects/window.c)
 
+# Spike 1: the transitive libraries that only resolve in group mode. Kept
+# opt-in so a normal build is untouched. --start-group/--end-group is required
+# because fontconfig <-> freetype reference each other.
+option(AWESOME_STATIC_DEPS "Link the extra transitive libs needed for a fully static build" OFF)
+if(AWESOME_STATIC_DEPS)
+    list(APPEND AWESOME_REQUIRED_LDFLAGS
+        -Wl,--start-group
+        -lxcb-image -lxcb-shm -lxcb-render-util -lX11-xcb
+        -lXdmcp -lXau -lXext -lXft -lfreetype -lpng -lXrender
+        -lexpat -lxml2 -lz -lbz2 -llzma -lbrotlidec -lbrotlicommon
+        -lfribidi -lharfbuzz -lgraphite2
+        -lgio-2.0 -lgobject-2.0 -lglib-2.0 -lgmodule-2.0
+        -lpcre -lffi -lpixman-1 -ljpeg -lfontconfig
+        -lmount -luuid -lblkid
+        -lXinerama -lXfixes -lXrandr -lXcomposite
+        -lm -lc -ldl -lpthread -lrt -lutil -lcrypt
+        -Wl,--end-group)
+endif()
+
+# Spike 2: LGI shim. Builds a Pango/PangoCairo binding against the real Pango
+# C API and exposes it through package.preload (see luaa.c), so lib/ can drop
+# require("lgi") and the gobject-introspection runtime. Compiled straight from
+# the source tree: no configure_file copy step for lib/vendor/*.c.
+#
+# pkg-config is used for the include paths only. pkg_check_modules would emit
+# absolute .so paths, which break a -static link; the .a names are spelled out
+# below. Versioned libs need the -l: prefix (Alpine convention).
+option(AWESOME_LGISHIM "Build the static LGI shim (lib/vendor/lgishim_pango.c)" OFF)
+if(AWESOME_LGISHIM)
+    include(FindPkgConfig)
+    pkg_check_modules(LGISHIM_PANGO_REQUIRED pango pangocairo)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pango.c)
+    # include_directories() was already called above (before this option block
+    # ran), so appending to AWESOME_REQUIRED_INCLUDE_DIRS here would be a no-op.
+    # Re-invoking include_directories() is cumulative for every target added
+    # later in this file, which is what we need.
+    include_directories(${LGISHIM_PANGO_INCLUDE_DIRS})
+    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PANGO_INCLUDE_DIRS})
+    list(APPEND AWESOME_REQUIRED_LDFLAGS
+        -Wl,--start-group
+        -l:libpangocairo-1.0.a -l:libpangoft2-1.0.a -l:libpangoxft-1.0.a
+        -l:libpango-1.0.a -lcairo
+        -lfreetype -l:libpng16.a -lbrotlidec -lbrotlicommon
+        -lharfbuzz -lgraphite2 -lfontconfig -lfribidi -l:libpixman-1.a -luuid
+        -lgmodule-2.0 -lgio-2.0 -lgobject-2.0 -lglib-2.0
+        -lexpat -lbz2 -lz -lpcre -lnettle -lffi -lintl
+        -Wl,--end-group)
+endif()
+
 set(AWE_MAN_SRCS
     ${SOURCE_DIR}/manpages/awesome.1.txt
     ${SOURCE_DIR}/manpages/awesome-client.1.txt
