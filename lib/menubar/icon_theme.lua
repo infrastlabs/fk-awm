@@ -12,7 +12,7 @@
 
 local beautiful = require("beautiful")
 local gfs = require("gears.filesystem")
-local GLib = require("lgi").GLib
+local GLib = require("vendor.lgishim").GLib
 local index_theme = require("menubar.index_theme")
 
 local ipairs = ipairs

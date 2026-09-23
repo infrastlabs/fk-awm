@@ -13,7 +13,7 @@
 local base = require("wibox.widget.base")
 local gdebug = require("gears.debug")
 local beautiful = require("beautiful")
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local gtable = require("gears.table")
 local Pango = lgi.Pango
 local PangoCairo = lgi.PangoCairo
@@ -371,7 +371,7 @@ end
 --
 --    #!/usr/bin/env lua
 --
---    local lgi = require("lgi")
+--    local lgi = require("vendor.lgishim")
 --    local pangocairo = lgi.PangoCairo
 --
 --    local font_map = pangocairo.font_map_get_default()

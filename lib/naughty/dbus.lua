@@ -15,7 +15,7 @@ local capi = { awesome = awesome }
 local gsurface = require("gears.surface")
 local gdebug  = require("gears.debug")
 local protected_call = require("gears.protected_call")
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local cairo, Gio, GLib, GObject = lgi.cairo, lgi.Gio, lgi.GLib, lgi.GObject
 
 local schar = string.char

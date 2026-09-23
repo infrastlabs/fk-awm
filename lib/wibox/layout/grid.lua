@@ -34,7 +34,7 @@ local gmath = require("gears.math")
 local gcolor = require("gears.color")
 local gdebug = require("gears.debug")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 
 local grid = { mt = {} }
 

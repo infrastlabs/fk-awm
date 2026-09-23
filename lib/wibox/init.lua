@@ -19,7 +19,7 @@ local object = require("gears.object")
 local grect =  require("gears.geometry").rectangle
 local beautiful = require("beautiful")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 
 
 --- This provides widget box windows. Every wibox can also be used as if it were

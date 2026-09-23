@@ -35,7 +35,7 @@ local wibox     = require("wibox")
 local gfs       = require("gears.filesystem")
 local timer     = require("gears.timer")
 local gmath     = require("gears.math")
-local cairo     = require("lgi").cairo
+local cairo     = require("vendor.lgishim").cairo
 local util      = require("awful.util")
 
 local function get_screen(s)

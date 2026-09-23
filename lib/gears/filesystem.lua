@@ -8,7 +8,7 @@
 ---------------------------------------------------------------------------
 
 -- Grab environment we need
-local Gio = require("lgi").Gio
+local Gio = require("vendor.lgishim").Gio
 local gstring = require("gears.string")
 local gtable = require("gears.table")
 

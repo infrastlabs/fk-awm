@@ -14,7 +14,7 @@ local capi = {
 }
 local beautiful = require("beautiful")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local color = require("gears.color")
 local object = require("gears.object")
 local surface = require("gears.surface")

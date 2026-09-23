@@ -72,7 +72,7 @@ local gtable = require("gears.table")
 local gobject = require("gears.object")
 local gtimer = require("gears.timer")
 local akeyboard = require("awful.keyboard")
-local glib = require("lgi").GLib
+local glib = require("vendor.lgishim").GLib
 local capi = { keygrabber = keygrabber, root = root, awesome = awesome }
 
 local keygrab = {}

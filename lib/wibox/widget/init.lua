@@ -6,7 +6,7 @@
 -- @module wibox.widget
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local hierarchy = require("wibox.hierarchy")
 local gcolor = require("gears.color")
 local beautiful = nil

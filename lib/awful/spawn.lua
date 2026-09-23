@@ -223,7 +223,7 @@ local capi =
     mouse = mouse,
     client = client,
 }
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local Gio = lgi.Gio
 local GLib = lgi.GLib
 local util   = require("awful.util")

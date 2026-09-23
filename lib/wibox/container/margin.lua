@@ -12,7 +12,7 @@ local pairs = pairs
 local setmetatable = setmetatable
 local base = require("wibox.widget.base")
 local gcolor = require("gears.color")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local gtable = require("gears.table")
 
 local margin = { mt = {} }

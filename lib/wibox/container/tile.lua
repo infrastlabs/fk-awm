@@ -10,7 +10,7 @@
 -- @containermod wibox.container.tile
 -- @supermodule wibox.container.place
 local place = require("wibox.container.place")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local widget = require("wibox.widget")
 local gtable = require("gears.table")
 

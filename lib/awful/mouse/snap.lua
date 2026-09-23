@@ -13,7 +13,7 @@ local wibox     = require("wibox")
 local beautiful = require("beautiful")
 local color     = require("gears.color")
 local shape     = require("gears.shape")
-local cairo     = require("lgi").cairo
+local cairo     = require("vendor.lgishim").cairo
 local alayout   = require("awful.layout")
 
 local capi = {

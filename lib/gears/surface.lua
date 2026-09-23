@@ -9,17 +9,22 @@
 local setmetatable = setmetatable
 local type = type
 local capi = { awesome = awesome }
-local cairo = require("lgi").cairo
-local GdkPixbuf = require("lgi").GdkPixbuf
+local cairo = require("vendor.lgishim").cairo
+local GdkPixbuf = require("vendor.lgishim").GdkPixbuf
 local color, beautiful = nil, nil
 local gdebug = require("gears.debug")
 local hierarchy = require("wibox.hierarchy")
 local ceil = math.ceil
 
--- Keep this in sync with build-utils/lgi-check.c!
-local ver_major, ver_minor, ver_patch = string.match(require('lgi.version'), '(%d)%.(%d)%.(%d)')
-if tonumber(ver_major) <= 0 and (tonumber(ver_minor) < 8 or (tonumber(ver_minor) == 8 and tonumber(ver_patch) < 0)) then
-    error("lgi too old, need at least version 0.8.0")
+-- Keep this in sync with build-utils/lgi-check.c! `version` is nil under the
+-- LGI shim (lib/vendor/lgishim.lua), which replaces lgi instead of wrapping
+-- it, so there is nothing to version-check there.
+local lgishim_version = require("vendor.lgishim").version
+if lgishim_version then
+    local ver_major, ver_minor, ver_patch = string.match(lgishim_version, '(%d)%.(%d)%.(%d)')
+    if tonumber(ver_major) <= 0 and (tonumber(ver_minor) < 8 or (tonumber(ver_minor) == 8 and tonumber(ver_patch) < 0)) then
+        error("lgi too old, need at least version 0.8.0")
+    end
 end
 
 local surface = { mt = {} }

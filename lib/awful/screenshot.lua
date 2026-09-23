@@ -35,12 +35,12 @@ local capi = {
 local gears     = require("gears")
 local beautiful = require("beautiful")
 local wibox     = require("wibox")
-local cairo     = require("lgi").cairo
+local cairo     = require("vendor.lgishim").cairo
 local abutton   = require("awful.button")
 local akey      = require("awful.key")
 local akgrabber = require("awful.keygrabber")
 local gtimer    = require("gears.timer")
-local glib      = require("lgi").GLib
+local glib      = require("vendor.lgishim").GLib
 local datetime  = glib.DateTime
 local timezone  = glib.TimeZone
 

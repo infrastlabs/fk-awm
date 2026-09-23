@@ -6,7 +6,7 @@
 -- @classmod gears.matrix
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local matrix = {}
 
 -- Metatable for matrix instances. This is set up near the end of the file.

@@ -10,7 +10,7 @@
 
 local matrix = require("gears.matrix")
 local protected_call = require("gears.protected_call")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local base = require("wibox.widget.base")
 local no_parent = base.no_parent_I_know_what_I_am_doing
 

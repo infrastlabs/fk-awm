@@ -20,7 +20,7 @@ local gmath = require("gears.math")
 local object = require("gears.object")
 local grect =  require("gears.geometry").rectangle
 local gsurf = require("gears.surface")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 
 local function get_screen(s)
     return s and capi.screen[s]

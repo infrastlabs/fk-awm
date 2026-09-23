@@ -8,7 +8,7 @@
 
 -- Grab environment we need
 local surface = require("gears.surface")
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local capi =
 {
     client = client,

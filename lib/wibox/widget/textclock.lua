@@ -48,7 +48,7 @@ local os = os
 local textbox = require("wibox.widget.textbox")
 local timer = require("gears.timer")
 local gtable = require("gears.table")
-local glib = require("lgi").GLib
+local glib = require("vendor.lgishim").GLib
 local DateTime = glib.DateTime
 local TimeZone = glib.TimeZone
 

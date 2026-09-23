@@ -6,7 +6,7 @@
 -- @module beautiful
 ----------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local surface = require("gears.surface")
 local gears_color = require("gears.color")
 local recolor_image = gears_color.recolor_image

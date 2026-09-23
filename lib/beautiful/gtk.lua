@@ -70,7 +70,7 @@ function gtk.get_theme_variables()
 
     local result = {}
     local _gtk_status, Gtk = pcall(function()
-        local lgi = require('lgi')
+        local lgi = require("vendor.lgishim")
         return lgi.require('Gtk', '3.0')
     end)
     if not _gtk_status or not Gtk then

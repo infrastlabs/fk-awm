@@ -29,7 +29,7 @@ local timer = require("gears.timer")
 local hierarchy = require("wibox.hierarchy")
 local base = require("wibox.widget.base")
 local gtable = require("gears.table")
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local GLib = lgi.GLib
 
 local scroll = {}

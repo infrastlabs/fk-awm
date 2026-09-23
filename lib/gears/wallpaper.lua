@@ -8,7 +8,7 @@
 -- @utillib gears.wallpaper
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local cairo = require("vendor.lgishim").cairo
 local color = require("gears.color")
 local surface = require("gears.surface")
 local timer = require("gears.timer")

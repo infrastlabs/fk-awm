@@ -13,11 +13,11 @@ local pairs = pairs
 local type = type
 local dofile = dofile
 local setmetatable = setmetatable
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local Pango = lgi.Pango
 local PangoCairo = lgi.PangoCairo
 local gears_debug = require("gears.debug")
-local Gio = require("lgi").Gio
+local Gio = require("vendor.lgishim").Gio
 local protected_call = require("gears.protected_call")
 
 local xresources = require("beautiful.xresources")

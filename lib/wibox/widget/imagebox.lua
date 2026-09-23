@@ -24,7 +24,7 @@
 -- @supermodule wibox.widget.base
 ---------------------------------------------------------------------------
 
-local lgi = require("lgi")
+local lgi = require("vendor.lgishim")
 local cairo = lgi.cairo
 
 local base = require("wibox.widget.base")

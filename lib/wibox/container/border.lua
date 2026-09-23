@@ -46,7 +46,7 @@ local gtable   = require("gears.table")
 local imagebox = require("wibox.widget.imagebox")
 local base     = require("wibox.widget.base")
 local gsurface = require("gears.surface")
-local cairo    = require("lgi").cairo
+local cairo    = require("vendor.lgishim").cairo
 
 local components = {
     "top_left", "top", "top_right", "right", "bottom_right", "bottom",
