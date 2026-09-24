@@ -20,17 +20,26 @@ local ok, Pango = pcall(require, "lgishim_pango")
 if ok and type(Pango) == "table" then
     local ok2, PangoCairo = pcall(require, "lgishim_pangocairo")
     local ok3, Cairo = pcall(require, "lgishim_cairo")
+    local ok4, GdkPixbuf = pcall(require, "lgishim_pixbuf")
+    local ok5, GLib = pcall(require, "lgishim_glib")
+    local ok6, GObject = pcall(require, "lgishim_gobject")
     M = {
         shim = true,
         Pango = Pango,
         PangoCairo = ok2 and PangoCairo or {},
         Cairo = ok3 and Cairo or {},
-        GLib = {},
+        GdkPixbuf = ok4 and GdkPixbuf or {},
+        GLib = ok5 and GLib or {},
         Gio = {},
         Rsvg = {},
-        GObject = {},
+        GObject = ok6 and GObject or {},
     }
     M.cairo = M.Cairo  -- lowercase alias for the codebase's lgi.cairo usage
+    M.gdkpixbuf = M.GdkPixbuf
+    -- C-side copy of the class table would be a *distinct* table, so the
+    -- lowercase class alias is bound here where the assignment is a real
+    -- identity copy (lib/menubar/utils.lua et al. look for `pixbuf`).
+    M.GdkPixbuf.pixbuf = M.GdkPixbuf.Pixbuf
 else
     M = require("lgi")
     M.shim = false
