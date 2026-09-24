@@ -70,6 +70,10 @@
 extern int luaopen_lgishim_pango(lua_State *L);
 extern int luaopen_lgishim_pangocairo(lua_State *L);
 extern int luaopen_lgishim_cairo(lua_State *L);
+extern int luaopen_lgishim_glib(lua_State *L);
+extern int luaopen_lgishim_pixbuf(lua_State *L);
+extern int luaopen_lgishim_gobject(lua_State *L);
+extern int luaopen_lgishim_gio(lua_State *L);
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -1145,6 +1149,14 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
     lua_setfield(L, -2, "lgishim_pangocairo");
     lua_pushcfunction(L, luaopen_lgishim_cairo);
     lua_setfield(L, -2, "lgishim_cairo");
+    lua_pushcfunction(L, luaopen_lgishim_glib);
+    lua_setfield(L, -2, "lgishim_glib");
+    lua_pushcfunction(L, luaopen_lgishim_pixbuf);
+    lua_setfield(L, -2, "lgishim_pixbuf");
+    lua_pushcfunction(L, luaopen_lgishim_gobject);
+    lua_setfield(L, -2, "lgishim_gobject");
+    lua_pushcfunction(L, luaopen_lgishim_gio);
+    lua_setfield(L, -2, "lgishim_gio");
     lua_pop(L, 2);
 
     luaA_object_setup(L);

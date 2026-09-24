@@ -1056,7 +1056,6 @@ variant_new(lua_State *L)
          * a comma-free sequence of type specifiers. */
         size_t flen = strlen(fmt);
         GVariant **children = NULL;
-        GVariantType *vt = NULL;
         GVariant *tup = NULL;
         size_t i = 0;
         size_t n = 0;
@@ -1097,12 +1096,10 @@ variant_new(lua_State *L)
                 children[i] = variant_from_table(L, -1, child_fmt);
                 lua_pop(L, 1);
             }
-            vt = g_variant_type_new("");
-            /* The empty type string means "tuple with n children"; but we
-             * already know n. Build the tuple with the explicit child count. */
+            /* g_variant_new_tuple() assembles the tuple type itself; there is
+             * nothing to build with g_variant_type_new() beforehand. */
             tup = g_variant_new_tuple(children, (gint)n);
             g_free(children);
-            g_variant_type_free(vt);
             v = tup;
         } else {
             /* Empty tuple "()" */
@@ -1147,7 +1144,13 @@ variant_get_child_value(lua_State *L)
 {
     GVariant *v = (GVariant *)chk(L, 1);
     gint idx = (gint)luaL_checkinteger(L, 2);
-    GVariant *child = g_variant_get_child_value(v, idx);
+    GVariant *child;
+
+    /* Range-check first: g_variant_get_child_value() only asserts on bad
+     * indexes, it does not report an error. */
+    if (idx < 0 || (gsize)idx > (gsize)g_variant_n_children(v))
+        return luaL_error(L, "lgishim.GLib.Variant.get_child_value: index %d out of range", idx);
+    child = g_variant_get_child_value(v, idx);
     if (!child)
         return luaL_error(L, "lgishim.GLib.Variant.get_child_value: index %d out of range", idx);
     return push_obj(L, child, d_variant, C_VARIANT);

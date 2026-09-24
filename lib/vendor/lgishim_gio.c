@@ -1,0 +1,2399 @@
+/*
+ * lgishim_gio.c - Gio Lua binding for the LGI shim.
+ *
+ * Replaces `lgi.Gio` for the subset awesomewm's lib/ actually uses, so that
+ * gears/filesystem.lua (GFile + GFileInfo + GFileEnumerator), awful/spawn.lua
+ * (DataInputStream over MemoryInputStream / UnixInputStream), menubar/utils.lua
+ * (enumerate_children + get_child + parse_dir) and naughty/dbus.lua (session
+ * bus: own_name, register_object, emit_signal, proxy call_sync) all work
+ * without the gobject-introspection runtime.
+ *
+ * Same wrapper object model as lgishim_glib.c / lgishim_gobject.c /
+ * lgishim_pixbuf.c: every object is a full userdata {ptr, destroy, cls};
+ * `__gc` calls destroy(), `finish` releases early, `_native` returns the raw
+ * pointer.
+ *
+ * Public API (docs/sam/spike4-glib-gio-scope-v2.md, Gio section):
+ *   File:             new_for_path, new_for_uri, get_parent, get_child,
+ *                     get_path, get_uri, get_basename, get_display_name,
+ *                     query_info, query_file_type, query_exists,
+ *                     make_directory, make_directory_with_parents, delete,
+ *                     enumerate_children, async_enumerate_children
+ *   FileInfo:         get_name, get_display_name, get_file_type,
+ *                     get_attribute_boolean, get_attribute_string
+ *   FileEnumerator:   next_file, next_files, async_next_files, get_child,
+ *                     get_container, has_pending, is_closed, close,
+ *                     async_close
+ *   DataInputStream:  new, read_line, read_line_async, read_line_finish,
+ *                     set_buffer_size, close
+ *   MemoryInputStream:new_from_data
+ *   UnixInputStream:  new, get_fd
+ *   DBusConnection:   new_sync, call_sync, emit_signal, register_object,
+ *                     close, close_sync, is_closed, flush_sync,
+ *                     get_unique_name
+ *   DBusProxy:        new_for_bus, new_for_bus_sync, call_sync, get_name,
+ *                     get_object_path, get_interface_name
+ *   DBusMethodInvocation: get_sender, get_object_path, get_interface_name,
+ *                     get_method_name, get_parameters, return_value,
+ *                     return_error
+ *   DBusVariant:      new, value, type_string, n_children
+ *   FakeInfo builders: DBusArgInfo, DBusMethodInfo, DBusSignalInfo,
+ *                     DBusInterfaceInfo -- marshalled into a real
+ *                     GDBusNodeInfo/GDBusInterfaceInfo pair through
+ *                     g_dbus_node_info_new_for_xml()
+ *   module functions: bus_get_sync, bus_own_name, Async.start
+ *   enum constants:   BusType, BusNameOwnerFlags, DBusProxyFlags,
+ *                     DBusCallFlags, FileQueryInfoFlags, FileType,
+ *                     IOErrorEnum, FILE_ATTRIBUTE_*
+ *
+ * Enum direction, matching LGI: constants going OUT are the C integers (they
+ * are passed straight into glib calls), values coming IN are strings
+ * ("DIRECTORY", "EXISTS"), which is what lib/ compares against. flags_arg()
+ * accepts an integer, nil, or the empty table that gears/filesystem.lua:96
+ * passes in for FileQueryInfoFlags.NONE.
+ *
+ * Six bug-avoidance rules inherited from the pango/cairo/glib/gobject shims:
+ *   1. lua_setfield(REG_CLASSES) pops the table -- re-fetch with lua_getfield
+ *      before writing clsinfo (see class_setup).
+ *   2. luaL_setmetatable already pops the metatable -- no second
+ *      lua_setmetatable.
+ *   3. m_index uses lua_replace(L, 3) BEFORE lua_settop(L, 3).
+ *   4. Callback refs are luaL_ref()ed at registration and luaL_unref()ed
+ *      exactly once, by either the GLib destroy notify or __gc.
+ *   5. release() NULLs ptr and swaps destroy to d_noop -- no double-free.
+ *   6. lua_pushstring only -- never lua_pushlstring(..., -1).
+ *
+ * This glib build (2.70) has no g_file_info_free/unref, no
+ * g_data_input_stream_set_buffer_size, no g_variant_type_peek_dict_entry, no
+ * g_dbus_interface_info_get_name/get_methods, no g_gio_error_quark and no
+ * g_variant_dup_variant; the per-function notes say what each is replaced by.
+ *
+ * GVariant ownership (glib 2.70, verified against the docs and the ABI):
+ * call_sync(), call() and emit_signal() do NOT take ownership of a
+ * non-floating variant, so a ref'd copy is passed and unref'ed here;
+ * g_dbus_method_invocation_return_value() consumes only a *floating* variant
+ * and never unrefs a non-floating one, so the same ref'd-copy discipline is
+ * balanced in every path, including the since-2.48 no-reply-expectd `out:`
+ * path; get_parameters() is transfer none (ref it), the proxy reply is
+ * transfer full (wrap as is), and the vtable hands the invocation over with
+ * transfer-full ownership, so ref'ing it before wrapping makes
+ * return_value()'s unref and __gc's unref balance to zero.
+ */
+
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
+
+#include <glib.h>
+#include <glib-object.h>
+#include <gio/gio.h>
+#include <gio/gunixinputstream.h>
+
+#include <stdlib.h>
+#include <string.h>
+
+/* Exported to luaa.c, which registers it in package.preload. */
+int luaopen_lgishim_gio(lua_State *L);
+
+/* Exported by lgishim_gobject.c: unwrap a `GObject.Closure` userdata to the
+ * GClosure* it holds. We only ever read the callback ref out of it. */
+GClosure *lgishim_gobject_check_closure(lua_State *L, int idx);
+
+/*
+ * lgishim_gobject.c stores { lua_State *L; int ref; } in GClosure->data
+ * (closure_new() installs it, closure_marshal() reads it back as
+ * `(cbdata *)closure->data`). Reading it lets us call a `GObject.Closure`
+ * callback from our own marshalling instead of routing through its
+ * GValue marshaler, which is what lib/ expects (a `GObject.Closure` object is
+ * handed to register_object() / bus_own_name() at naughty/dbus.lua:433).
+ */
+typedef struct {
+    lua_State *L;
+    int ref;
+} gobject_cbdata;
+
+/* The first three fields of every other module's wrap; we only read ->p. */
+typedef struct {
+    void *p;
+    void (*destroy)(void *);
+    int cls;
+} foreign_wrap;
+
+enum {
+    C_FILE = 1,
+    C_FILEINFO,
+    C_FILEENUM,
+    C_DATAIN,
+    C_MEMIN,
+    C_UNIXIN,
+    C_DBUSCONN,
+    C_DBUSPROXY,
+    C_DBUSINV,
+    C_DBUSVAR,
+    C_DBUSARG,
+    C_DBUSMETHOD,
+    C_DBUSSIGNAL,
+    C_DBUSIFACE,
+    N_GIO_CLASSES
+};
+
+static const char *CLS_NAMES[N_GIO_CLASSES] = {
+    NULL,
+    "lgishim_gio.File",
+    "lgishim_gio.FileInfo",
+    "lgishim_gio.FileEnumerator",
+    "lgishim_gio.DataInputStream",
+    "lgishim_gio.MemoryInputStream",
+    "lgishim_gio.UnixInputStream",
+    "lgishim_gio.DBusConnection",
+    "lgishim_gio.DBusProxy",
+    "lgishim_gio.DBusMethodInvocation",
+    "lgishim_gio.DBusVariant",
+    "lgishim_gio.DBusArgInfo",
+    "lgishim_gio.DBusMethodInfo",
+    "lgishim_gio.DBusSignalInfo",
+    "lgishim_gio.DBusInterfaceInfo",
+};
+
+#define REG_CLASSES "lgishim_gio_classes"
+
+typedef struct {
+    void *p;
+    void (*destroy)(void *);
+    int cls;
+} wrap;
+
+/* --------------------------------------------------------------- helpers */
+
+static void d_noop(void *p) { (void)p; }
+static void d_object(void *p) { g_object_unref((GObject *)p); }
+static void d_variant(void *p) { g_variant_unref((GVariant *)p); }
+
+static wrap *
+getud(lua_State *L, int idx)
+{
+    return lua_touserdata(L, idx);
+}
+
+static void *
+chk(lua_State *L, int idx)
+{
+    wrap *w = getud(L, idx);
+
+    if (!w || !w->p)
+        luaL_error(L, "lgishim_gio: expected object at arg %d, got %s",
+                   idx, w ? (w->p ? "a freed object" : luaL_typename(L, idx))
+                          : luaL_typename(L, idx));
+    return w->p;
+}
+
+static void *
+chk_cls(lua_State *L, int idx, int cls)
+{
+    wrap *w = getud(L, idx);
+
+    if (!w || !w->p)
+        luaL_error(L, "lgishim_gio: expected %s at arg %d, got %s",
+                   CLS_NAMES[cls], idx,
+                   w ? (w->p ? CLS_NAMES[w->cls] : luaL_typename(L, idx))
+                     : luaL_typename(L, idx));
+    if (w->cls != cls)
+        luaL_error(L, "lgishim_gio: expected %s at arg %d, got %s",
+                   CLS_NAMES[cls], idx, CLS_NAMES[w->cls]);
+    return w->p;
+}
+
+static int
+push_obj(lua_State *L, void *p, void (*destroy)(void *), int cls)
+{
+    wrap *w;
+
+    /* The object must be created BEFORE luaL_setmetatable(): the macro is
+     * luaL_getmetatable + lua_setmetatable(-2) and already pops the
+     * metatable, so the userdata has to sit underneath it. */
+    w = (wrap *)lua_newuserdata(L, sizeof(wrap));
+    memset(w, 0, sizeof(*w));
+    w->p = p;
+    w->destroy = destroy;
+    w->cls = cls;
+    luaL_setmetatable(L, CLS_NAMES[cls]);
+    return 1;
+}
+
+/* --------------------------------------------------------- shared protocol */
+
+static int
+m_index(lua_State *L)
+{
+    wrap *w = getud(L, 1);
+    const char *k;
+    if (!w)
+        return 0;
+    k = luaL_checkstring(L, 2);
+
+    /* Stack on entry: [obj, key]. The result has to land at slot 3 so that
+     * `return 1` hands it back to __index, so every lookup proceeds as
+     * [obj, key, clsinfo, ...] and gets swapped to slot 3 with lua_replace
+     * before truncating with lua_settop(L, 3). */
+    lua_getfield(L, LUA_REGISTRYINDEX, REG_CLASSES);
+    lua_rawgeti(L, -1, w->cls);                /* [.., clsinfo] */
+
+    lua_getfield(L, -1, "m");
+    lua_getfield(L, -1, k);
+    if (lua_isfunction(L, -1)) {
+        lua_replace(L, 3);
+        lua_settop(L, 3);
+        return 1;
+    }
+    lua_pop(L, 2);
+
+    /* Property getters: a per-class "p" table of functions called as (obj),
+     * for field-style access such as `variant.value` (naughty/dbus.lua reads
+     * `.value` without parens, so a method function would not do). */
+    lua_getfield(L, -1, "p");
+    lua_getfield(L, -1, k);
+    if (lua_isfunction(L, -1)) {
+        lua_pushvalue(L, 1);
+        lua_call(L, 1, 1);
+        lua_replace(L, 3);
+        lua_settop(L, 3);
+        return 1;
+    }
+    lua_pop(L, 2);
+
+    luaL_getmetatable(L, CLS_NAMES[w->cls]);   /* [.., metatable] */
+    lua_getfield(L, -1, k);
+    if (!lua_isnil(L, -1)) {
+        lua_replace(L, 3);
+        lua_settop(L, 3);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+m_newindex(lua_State *L)
+{
+    luaL_error(L, "lgishim_gio: object is read-only");
+    return 0;
+}
+
+static int
+m_native(lua_State *L)
+{
+    wrap *w = getud(L, 1);
+    if (!w || !w->p)
+        return 0;
+    lua_pushlightuserdata(L, w->p);
+    return 1;
+}
+
+static void
+release(wrap *w)
+{
+    if (w && w->p) {
+        w->destroy(w->p);
+        w->p = NULL;
+        w->destroy = d_noop;
+    }
+}
+
+static int
+m_finish(lua_State *L)
+{
+    release(getud(L, 1));
+    return 0;
+}
+
+static int
+m_gc(lua_State *L)
+{
+    release(getud(L, 1));
+    return 0;
+}
+
+static int
+m_is_type_of(lua_State *L)
+{
+    int same = 0;
+
+    /* The discriminator is metatable IDENTITY, deliberately not w->cls: the
+     * other shims define the same wrap layout with their own cls enum, so an
+     * index comparison would let a Pango.Layout pass as a Gio.File. Every
+     * userdata carries exactly one registered metatable, so comparing the
+     * tables is sound across module boundaries. */
+    lua_pushvalue(L, lua_upvalueindex(1));     /* [.., expected_mt] */
+    if (lua_getmetatable(L, 2)) {              /* [.., expected_mt, obj_mt] */
+        same = lua_rawequal(L, -2, -1);
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    lua_pushboolean(L, same ? TRUE : FALSE);
+    return 1;
+}
+
+static int
+class_call(lua_State *L)
+{
+    lua_getfield(L, 1, "new");
+    lua_insert(L, 2);
+    lua_remove(L, 1);
+    lua_call(L, lua_gettop(L) - 1, 1);
+    return 1;
+}
+
+static void
+make_class_table(lua_State *L, int cls, const luaL_Reg *m, const luaL_Reg *p)
+{
+    luaL_newmetatable(L, CLS_NAMES[cls]);
+    lua_pushcfunction(L, m_index);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, m_newindex);
+    lua_setfield(L, -2, "__newindex");
+    lua_pushcfunction(L, m_native);
+    lua_setfield(L, -2, "_native");
+    lua_pushcfunction(L, m_finish);
+    lua_setfield(L, -2, "finish");
+    lua_pushcfunction(L, m_gc);
+    lua_setfield(L, -2, "__gc");
+    luaL_setfuncs(L, m, 0);
+    lua_pop(L, 1);                             /* metatable */
+
+    lua_getfield(L, LUA_REGISTRYINDEX, REG_CLASSES);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_setfield(L, LUA_REGISTRYINDEX, REG_CLASSES);
+        lua_getfield(L, LUA_REGISTRYINDEX, REG_CLASSES); /* re-push */
+    }
+    lua_newtable(L);                           /* clsinfo */
+    lua_newtable(L);
+    luaL_setfuncs(L, m, 0);
+    lua_setfield(L, -2, "m");
+    if (p) {
+        lua_newtable(L);
+        luaL_setfuncs(L, p, 0);
+        lua_setfield(L, -2, "p");
+    }
+    lua_rawseti(L, -2, cls);
+    lua_pop(L, 1);                             /* registry array */
+
+    lua_newtable(L);                           /* class table */
+    luaL_setfuncs(L, m, 0);
+    lua_newtable(L);
+    lua_pushcclosure(L, class_call, 0);
+    lua_setfield(L, -2, "__call");
+    lua_setmetatable(L, -2);
+
+    luaL_getmetatable(L, CLS_NAMES[cls]);
+    lua_pushcclosure(L, m_is_type_of, 1);
+    lua_setfield(L, -2, "is_type_of");
+}
+
+static void
+class_setup(lua_State *L, int cls, const luaL_Reg *m, const luaL_Reg *p)
+{
+    make_class_table(L, cls, m, p);
+}
+
+/* ------------------------------------------------------------- enum tables */
+
+struct enumpair {
+    const char *name;
+    int value;
+};
+
+static void
+install_enum(lua_State *L, const char *field,
+             const struct enumpair *t, size_t n)
+{
+    size_t i;
+
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)t[i].value);
+        lua_setfield(L, -2, t[i].name);
+    }
+    lua_setfield(L, -2, field);
+}
+
+static const struct enumpair BUS_TYPES[] = {
+    { "STARTER", G_BUS_TYPE_STARTER },
+    { "NONE",    G_BUS_TYPE_NONE },
+    { "SYSTEM",  G_BUS_TYPE_SYSTEM },
+    { "SESSION", G_BUS_TYPE_SESSION },
+};
+
+static const struct enumpair BUS_NAME_OWNER_FLAGS[] = {
+    { "NONE",              G_BUS_NAME_OWNER_FLAGS_NONE },
+    { "ALLOW_REPLACEMENT", G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT },
+    { "REPLACE",           G_BUS_NAME_OWNER_FLAGS_REPLACE },
+    { "DO_NOT_QUEUE",      G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE },
+};
+
+static const struct enumpair DBUS_PROXY_FLAGS[] = {
+    { "NONE",                              G_DBUS_PROXY_FLAGS_NONE },
+    { "DO_NOT_LOAD_PROPERTIES",            G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES },
+    { "DO_NOT_CONNECT_SIGNALS",            G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS },
+    { "DO_NOT_AUTO_START",                 G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START },
+    { "GET_INVALIDATED_PROPERTIES",        G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES },
+    { "DO_NOT_AUTO_START_AT_CONSTRUCTION", G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START_AT_CONSTRUCTION },
+};
+
+static const struct enumpair DBUS_CALL_FLAGS[] = {
+    { "NONE",  G_DBUS_CALL_FLAGS_NONE },
+    { "NO_AUTO_START", G_DBUS_CALL_FLAGS_NO_AUTO_START },
+    { "ALLOW_INTERACTIVE_AUTHORIZATION",
+      G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION },
+};
+
+static const struct enumpair FILE_QUERY_INFO_FLAGS[] = {
+    { "NONE",              G_FILE_QUERY_INFO_NONE },
+    { "NOFOLLOW_SYMLINKS", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS },
+};
+
+/*
+ * Flags come in two shapes: the integer this module installs, or the empty
+ * table that gears/filesystem.lua:96 passes for FileQueryInfoFlags.NONE.
+ */
+static guint
+flags_arg(lua_State *L, int idx, guint def)
+{
+    if (lua_isnoneornil(L, idx))
+        return def;
+    if (lua_isnumber(L, idx))
+        return (guint)luaL_checkinteger(L, idx);
+    if (lua_istable(L, idx) && lua_rawlen(L, idx) == 0)
+        return 0;
+    luaL_error(L, "lgishim_gio: bad flags value at arg %d", idx);
+    return def;
+}
+
+static const char *
+io_error_name(int code)
+{
+    static const struct enumpair names[] = {
+        { "FAILED", G_IO_ERROR_FAILED },
+        { "NOT_FOUND", G_IO_ERROR_NOT_FOUND },
+        { "EXISTS", G_IO_ERROR_EXISTS },
+        { "IS_DIRECTORY", G_IO_ERROR_IS_DIRECTORY },
+        { "NOT_DIRECTORY", G_IO_ERROR_NOT_DIRECTORY },
+        { "NOT_EMPTY", G_IO_ERROR_NOT_EMPTY },
+        { "NOT_REGULAR_FILE", G_IO_ERROR_NOT_REGULAR_FILE },
+        { "NOT_SYMBOLIC_LINK", G_IO_ERROR_NOT_SYMBOLIC_LINK },
+        { "NOT_MOUNTABLE_FILE", G_IO_ERROR_NOT_MOUNTABLE_FILE },
+        { "FILENAME_TOO_LONG", G_IO_ERROR_FILENAME_TOO_LONG },
+        { "INVALID_FILENAME", G_IO_ERROR_INVALID_FILENAME },
+        { "TOO_MANY_LINKS", G_IO_ERROR_TOO_MANY_LINKS },
+        { "NO_SPACE", G_IO_ERROR_NO_SPACE },
+        { "INVALID_ARGUMENT", G_IO_ERROR_INVALID_ARGUMENT },
+        { "PERMISSION_DENIED", G_IO_ERROR_PERMISSION_DENIED },
+        { "NOT_SUPPORTED", G_IO_ERROR_NOT_SUPPORTED },
+        { "NOT_MOUNTED", G_IO_ERROR_NOT_MOUNTED },
+        { "ALREADY_MOUNTED", G_IO_ERROR_ALREADY_MOUNTED },
+        { "CLOSED", G_IO_ERROR_CLOSED },
+        { "CANCELLED", G_IO_ERROR_CANCELLED },
+        { "PENDING", G_IO_ERROR_PENDING },
+        { "READ_ONLY", G_IO_ERROR_READ_ONLY },
+        { "CANT_CREATE_BACKUP", G_IO_ERROR_CANT_CREATE_BACKUP },
+        { "WRONG_ETAG", G_IO_ERROR_WRONG_ETAG },
+        { "TIMED_OUT", G_IO_ERROR_TIMED_OUT },
+        { "WOULD_RECURSE", G_IO_ERROR_WOULD_RECURSE },
+        { "BUSY", G_IO_ERROR_BUSY },
+        { "WOULD_BLOCK", G_IO_ERROR_WOULD_BLOCK },
+        { "HOST_NOT_FOUND", G_IO_ERROR_HOST_NOT_FOUND },
+        { "WOULD_MERGE", G_IO_ERROR_WOULD_MERGE },
+        { "FAILED_HANDLED", G_IO_ERROR_FAILED_HANDLED },
+        { "TOO_MANY_OPEN_FILES", G_IO_ERROR_TOO_MANY_OPEN_FILES },
+        { "NOT_INITIALIZED", G_IO_ERROR_NOT_INITIALIZED },
+        { "ADDRESS_IN_USE", G_IO_ERROR_ADDRESS_IN_USE },
+        { "PARTIAL_INPUT", G_IO_ERROR_PARTIAL_INPUT },
+        { "INVALID_DATA", G_IO_ERROR_INVALID_DATA },
+        { "DBUS_ERROR", G_IO_ERROR_DBUS_ERROR },
+        { "HOST_UNREACHABLE", G_IO_ERROR_HOST_UNREACHABLE },
+        { "NETWORK_UNREACHABLE", G_IO_ERROR_NETWORK_UNREACHABLE },
+        { "CONNECTION_REFUSED", G_IO_ERROR_CONNECTION_REFUSED },
+        { "PROXY_FAILED", G_IO_ERROR_PROXY_FAILED },
+        { "PROXY_AUTH_FAILED", G_IO_ERROR_PROXY_AUTH_FAILED },
+        { "PROXY_NEED_AUTH", G_IO_ERROR_PROXY_NEED_AUTH },
+        { "PROXY_NOT_ALLOWED", G_IO_ERROR_PROXY_NOT_ALLOWED },
+        { "BROKEN_PIPE", G_IO_ERROR_BROKEN_PIPE },
+        { "CONNECTION_CLOSED", G_IO_ERROR_CONNECTION_CLOSED },
+        { "NOT_CONNECTED", G_IO_ERROR_NOT_CONNECTED },
+        { "MESSAGE_TOO_LARGE", G_IO_ERROR_MESSAGE_TOO_LARGE },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (names[i].value == code)
+            return names[i].name;
+    return "UNKNOWN";
+}
+
+static const char *
+file_type_name(GFileType t)
+{
+    switch (t) {
+    case G_FILE_TYPE_UNKNOWN:       return "UNKNOWN";
+    case G_FILE_TYPE_REGULAR:       return "REGULAR";
+    case G_FILE_TYPE_DIRECTORY:     return "DIRECTORY";
+    case G_FILE_TYPE_SYMBOLIC_LINK: return "SYMBOLIC_LINK";
+    case G_FILE_TYPE_SPECIAL:       return "SPECIAL";
+    case G_FILE_TYPE_SHORTCUT:      return "SHORTCUT";
+    case G_FILE_TYPE_MOUNTABLE:     return "MOUNTABLE";
+    default:                        return "UNKNOWN";
+    }
+}
+
+/* --------------------------------------------------------- value marshalling */
+
+/*
+ * gears/filesystem.lua:22 matches `err.domain == Gio.IOErrorEnum` and
+ * `err.code == "EXISTS"`, so domain is the GType name string and code is the
+ * enum name string, exactly as LGI's GError table looks. g_gio_error_quark()
+ * does not exist in this build, so use the public g_io_error_quark().
+ */
+static void
+push_error(lua_State *L, GError *err)
+{
+    if (!err) {
+        lua_pushnil(L);
+        return;
+    }
+    lua_newtable(L);
+    if (err->domain == g_io_error_quark()) {
+        lua_pushstring(L, "Gio.IOErrorEnum");
+        lua_setfield(L, -2, "domain");
+        lua_pushstring(L, io_error_name(err->code));
+        lua_setfield(L, -2, "code");
+    } else {
+        const char *dom = g_quark_to_string(err->domain);
+        lua_pushstring(L, dom ? dom : "");
+        lua_setfield(L, -2, "domain");
+        lua_pushinteger(L, (lua_Integer)err->code);
+        lua_setfield(L, -2, "code");
+    }
+    lua_pushstring(L, err->message ? err->message : "");
+    lua_setfield(L, -2, "message");
+}
+
+/*
+ * Call a Lua function that GLib dispatched, catching raises. The tail has to
+ * be left empty because the callback shares the lua_State with the event
+ * loop (see lgishim_gobject.c's closure_marshal()).
+ */
+static void
+pcall_dispatch(lua_State *L, int nargs)
+{
+    if (lua_pcall(L, nargs, 1, 0) != 0) {
+        g_printerr("lgishim_gio callback error: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    } else {
+        lua_pop(L, 1);
+    }
+    lua_settop(L, 0);
+}
+
+/*
+ * `Gio.DBusVariant` in lgishim_glib.c already exposes a Variant userdata with
+ * metatable "lgishim.GLib.Variant"; both are accepted here and the raw
+ * GVariant* is lifted out of the wrapper's first field.
+ */
+static int
+is_variant_userdata(lua_State *L, int idx)
+{
+    const char *names[] = { "lgishim.GLib.Variant", CLS_NAMES[C_DBUSVAR] };
+    int i, ok = 0;
+
+    if (!lua_isuserdata(L, idx))
+        return 0;
+    for (i = 0; i < 2; i++) {
+        luaL_getmetatable(L, names[i]);        /* [.., metatable] */
+        if (lua_getmetatable(L, idx)) {        /* [.., metatable, obj_mt] */
+            ok = lua_rawequal(L, -1, -2);
+            lua_pop(L, 1);
+        } else {
+            lua_pop(L, 1);                     /* getmetatable popped the obj */
+        }
+        lua_pop(L, 1);                         /* the metatable */
+    }
+    return ok;
+}
+
+/* Returns a NEW reference, or NULL for a nil argument. */
+static GVariant *
+variant_from_lua(lua_State *L, int idx)
+{
+    foreign_wrap *w;
+
+    if (lua_isnoneornil(L, idx))
+        return NULL;
+    if (!is_variant_userdata(L, idx))
+        luaL_error(L, "lgishim_gio: expected a Variant at arg %d, got %s",
+                   idx, luaL_typename(L, idx));
+    w = (foreign_wrap *)lua_touserdata(L, idx);
+    if (!w || !w->p)
+        return NULL;
+    return g_variant_ref((GVariant *)w->p);
+}
+
+/*
+ * g_variant_to_lua(): a variant -> a Lua value. Tuples and non-dict arrays
+ * become 1-based tables (that is what DBusVariant.value is read as), dict
+ * entries become string-keyed tables (Notify's a{sv} hints), scalars become
+ * the matching Lua type. `v` inside a variant is unwrapped one level, which
+ * is the a{sv} case.
+ */
+static void
+variant_to_lua(lua_State *L, GVariant *v)
+{
+    const GVariantType *el;
+
+    if (!v) {
+        lua_pushnil(L);
+        return;
+    }
+    el = g_variant_type_element(g_variant_get_type(v));
+    switch (g_variant_classify(v)) {
+    case G_VARIANT_CLASS_BOOLEAN:
+        lua_pushboolean(L, g_variant_get_boolean(v) ? TRUE : FALSE);
+        break;
+    case G_VARIANT_CLASS_BYTE:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_byte(v));
+        break;
+    case G_VARIANT_CLASS_INT16:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_int16(v));
+        break;
+    case G_VARIANT_CLASS_UINT16:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_uint16(v));
+        break;
+    case G_VARIANT_CLASS_INT32:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_int32(v));
+        break;
+    case G_VARIANT_CLASS_UINT32:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_uint32(v));
+        break;
+    case G_VARIANT_CLASS_INT64:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_int64(v));
+        break;
+    case G_VARIANT_CLASS_UINT64:
+        lua_pushinteger(L, (lua_Integer)g_variant_get_uint64(v));
+        break;
+    case G_VARIANT_CLASS_DOUBLE:
+        lua_pushnumber(L, (lua_Number)g_variant_get_double(v));
+        break;
+    case G_VARIANT_CLASS_STRING: {
+        const char *s = g_variant_get_string(v, NULL);
+        lua_pushstring(L, s ? s : "");
+        break;
+    }
+    case G_VARIANT_CLASS_VARIANT: {
+        GVariant *inner = g_variant_ref(g_variant_get_child_value(v, 0));
+        variant_to_lua(L, inner);
+        g_variant_unref(inner);
+        break;
+    }
+    case G_VARIANT_CLASS_ARRAY: {
+        guint i, n = g_variant_n_children(v);
+        lua_newtable(L);
+        for (i = 0; i < n; i++) {
+            GVariant *child = g_variant_ref(g_variant_get_child_value(v, i));
+            if (g_variant_type_is_dict_entry(el)) {
+                GVariant *key = g_variant_ref(g_variant_get_child_value(child, 0));
+                GVariant *val = g_variant_ref(g_variant_get_child_value(child, 1));
+                const char *ks = g_variant_get_string(key, NULL);
+                variant_to_lua(L, val);
+                lua_pushstring(L, ks ? ks : "");
+                lua_insert(L, -2);
+                lua_rawset(L, -3);
+                g_variant_unref(val);
+                g_variant_unref(key);
+            } else {
+                variant_to_lua(L, child);
+                lua_rawseti(L, -2, (lua_Integer)(i + 1));
+            }
+            g_variant_unref(child);
+        }
+        break;
+    }
+    case G_VARIANT_CLASS_TUPLE: {
+        guint i, n = g_variant_n_children(v);
+        lua_newtable(L);
+        for (i = 0; i < n; i++) {
+            GVariant *child = g_variant_ref(g_variant_get_child_value(v, i));
+            variant_to_lua(L, child);
+            lua_rawseti(L, -2, (lua_Integer)(i + 1));
+            g_variant_unref(child);
+        }
+        break;
+    }
+    default: {
+        gchar *s = g_variant_print(v, TRUE);
+        lua_pushstring(L, s);
+        g_free(s);
+        break;
+    }
+    }
+}
+
+static void
+xml_esc(GString *out, const char *s)
+{
+    const char *p;
+
+    if (!s)
+        return;
+    for (p = s; *p; p++) {
+        switch (*p) {
+        case '&': g_string_append(out, "&amp;"); break;
+        case '<': g_string_append(out, "&lt;"); break;
+        case '>': g_string_append(out, "&gt;"); break;
+        case '\'': g_string_append(out, "&apos;"); break;
+        case '"': g_string_append(out, "&quot;"); break;
+        default: g_string_append_c(out, *p); break;
+        }
+    }
+}
+
+/* ============================================================ GFile family */
+
+static int
+file_new_for_path(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    return push_obj(L, g_file_new_for_path(path), d_object, C_FILE);
+}
+
+static int
+file_new_for_uri(lua_State *L)
+{
+    const char *uri = luaL_checkstring(L, 1);
+    return push_obj(L, g_file_new_for_uri(uri), d_object, C_FILE);
+}
+
+static int
+file_get_path(lua_State *L)
+{
+    const char *p = g_file_get_path(chk_cls(L, 1, C_FILE));
+    if (p)
+        lua_pushstring(L, p);
+    else
+        lua_pushnil(L);                       /* a URI-only GFile */
+    return 1;
+}
+
+static int
+file_get_uri(lua_State *L)
+{
+    lua_pushstring(L, g_file_get_uri(chk_cls(L, 1, C_FILE)));
+    return 1;
+}
+
+static int
+file_get_basename(lua_State *L)
+{
+    lua_pushstring(L, g_file_get_basename(chk_cls(L, 1, C_FILE)));
+    return 1;
+}
+
+/*
+ * g_file_get_display_name() does not exist in this glib build. GFile has no
+ * display name of its own (that is a GFileInfo attribute), and lib/ only
+ * reads it off files enumerated from the icon theme, where basename() is the
+ * documented fallback, so hand it back.
+ */
+static int
+file_get_display_name(lua_State *L)
+{
+    lua_pushstring(L, g_file_get_basename(chk_cls(L, 1, C_FILE)));
+    return 1;
+}
+
+static int
+file_get_parent(lua_State *L)
+{
+    GFile *f = g_file_get_parent(chk_cls(L, 1, C_FILE));
+    if (!f) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_obj(L, f, d_object, C_FILE);
+}
+
+static int
+file_get_child(lua_State *L)
+{
+    GFile *f = g_file_get_child(chk_cls(L, 1, C_FILE), luaL_checkstring(L, 2));
+    if (!f) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_obj(L, f, d_object, C_FILE);
+}
+
+static int
+file_query_exists(lua_State *L)
+{
+    lua_pushboolean(L, g_file_query_exists(chk_cls(L, 1, C_FILE), NULL) ? TRUE : FALSE);
+    return 1;
+}
+
+/* gears/filesystem.lua compares the result with "DIRECTORY" / "REGULAR". */
+static int
+file_query_file_type(lua_State *L)
+{
+    lua_pushstring(L, file_type_name(
+        g_file_query_file_type(chk_cls(L, 1, C_FILE), flags_arg(L, 2, 0), NULL)));
+    return 1;
+}
+
+static int
+file_query_info(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    GError *err = NULL;
+    GFileInfo *info;
+
+    info = g_file_query_info(f, luaL_checkstring(L, 2),
+                             flags_arg(L, 3, 0), NULL, &err);
+    if (!info) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, info, d_object, C_FILEINFO);
+}
+
+/*
+ * This glib build has no g_file_info_free()/g_file_info_unref(); GFileInfo is
+ * a plain GObject here, so g_object_unref() (d_object) releases it.
+ */
+static int
+fileinfo_get_name(lua_State *L)
+{
+    const char *s = g_file_info_get_name(chk_cls(L, 1, C_FILEINFO));
+    /* NULL when "standard::name" was not part of the query -- pushstring()
+     * does not accept a NULL (Lua 5.3 asserts). */
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+static int
+fileinfo_get_display_name(lua_State *L)
+{
+    const char *s = g_file_info_get_display_name(chk_cls(L, 1, C_FILEINFO));
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+static int
+fileinfo_get_file_type(lua_State *L)
+{
+    lua_pushstring(L, file_type_name(
+        g_file_info_get_file_type(chk_cls(L, 1, C_FILEINFO))));
+    return 1;
+}
+
+static int
+fileinfo_get_attribute_boolean(lua_State *L)
+{
+    lua_pushboolean(L, g_file_info_get_attribute_boolean(
+        chk_cls(L, 1, C_FILEINFO), luaL_checkstring(L, 2)) ? TRUE : FALSE);
+    return 1;
+}
+
+static int
+fileinfo_get_attribute_string(lua_State *L)
+{
+    const char *s = g_file_info_get_attribute_string(
+        chk_cls(L, 1, C_FILEINFO), luaL_checkstring(L, 2));
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+static int
+file_make_directory(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    GError *err = NULL;
+    gboolean ok = g_file_make_directory(f, NULL, &err);
+
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+file_make_directory_with_parents(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    GError *err = NULL;
+    gboolean ok = g_file_make_directory_with_parents(f, NULL, &err);
+
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+file_delete(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    GError *err = NULL;
+    gboolean ok = g_file_delete(f, NULL, &err);
+
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+file_enumerate_children(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    GError *err = NULL;
+    GFileEnumerator *e;
+
+    e = g_file_enumerate_children(f, luaL_checkstring(L, 2),
+                                  flags_arg(L, 3, 0), NULL, &err);
+    if (!e) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, e, d_object, C_FILEENUM);
+}
+
+static int
+fileinfo_new(lua_State *L)
+{
+    return push_obj(L, g_file_info_new(), d_object, C_FILEINFO);
+}
+
+static int
+fileenum_next_file(lua_State *L)
+{
+    GFileEnumerator *e = chk_cls(L, 1, C_FILEENUM);
+    GError *err = NULL;
+    GFileInfo *info = g_file_enumerator_next_file(e, NULL, &err);
+
+    if (!info) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, info, d_object, C_FILEINFO);
+}
+
+/*
+ * Both next_files() and async_next_files(): menubar/utils.lua:378 reads
+ * `list, err = enum:async_next_files(n)` in a loop and stops on #list == 0,
+ * so the synchronous form is what the loop needs. Returns a table of
+ * GFileInfo plus an error table (nil when none).
+ */
+static int
+fileenum_next_files(lua_State *L)
+{
+    GFileEnumerator *e = chk_cls(L, 1, C_FILEENUM);
+    guint n = (guint)luaL_optinteger(L, 2, 1);
+    GError *err = NULL;
+    GPtrArray *arr = g_ptr_array_new();
+    guint i;
+
+    if (n == 0)
+        n = 1;
+    for (i = 0; i < n; i++) {
+        GFileInfo *info = g_file_enumerator_next_file(e, NULL, &err);
+        if (!info)
+            break;
+        g_ptr_array_add(arr, info);
+    }
+    lua_newtable(L);
+    for (i = 0; i < arr->len; i++) {
+        push_obj(L, arr->pdata[i], d_object, C_FILEINFO);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    g_ptr_array_free(arr, TRUE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+fileenum_get_child(lua_State *L)
+{
+    GFile *c = g_file_enumerator_get_child(chk_cls(L, 1, C_FILEENUM),
+                                           chk_cls(L, 2, C_FILEINFO));
+    if (!c) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_obj(L, c, d_object, C_FILE);
+}
+
+static int
+fileenum_get_container(lua_State *L)
+{
+    lua_pushlightuserdata(L, (void *)g_file_enumerator_get_container(
+        chk_cls(L, 1, C_FILEENUM)));
+    return 1;
+}
+
+static int
+fileenum_has_pending(lua_State *L)
+{
+    lua_pushboolean(L, g_file_enumerator_has_pending(
+        chk_cls(L, 1, C_FILEENUM)) ? TRUE : FALSE);
+    return 1;
+}
+
+static int
+fileenum_is_closed(lua_State *L)
+{
+    lua_pushboolean(L, g_file_enumerator_is_closed(
+        chk_cls(L, 1, C_FILEENUM)) ? TRUE : FALSE);
+    return 1;
+}
+
+static int
+fileenum_close(lua_State *L)
+{
+    g_file_enumerator_close(chk_cls(L, 1, C_FILEENUM), NULL, NULL);
+    return 0;
+}
+
+static const luaL_Reg FILE_M[] = {
+    { "new_for_path",                file_new_for_path },
+    { "new_for_uri",                 file_new_for_uri },
+    { "get_parent",                  file_get_parent },
+    { "get_child",                   file_get_child },
+    { "get_path",                    file_get_path },
+    { "get_uri",                     file_get_uri },
+    { "get_basename",                file_get_basename },
+    { "get_display_name",            file_get_display_name },
+    { "query_exists",                file_query_exists },
+    { "query_file_type",             file_query_file_type },
+    { "query_info",                  file_query_info },
+    { "make_directory",              file_make_directory },
+    { "make_directory_with_parents", file_make_directory_with_parents },
+    { "delete",                      file_delete },
+    { "enumerate_children",          file_enumerate_children },
+    { "async_enumerate_children",    file_enumerate_children },
+    { NULL, NULL },
+};
+
+static const luaL_Reg FILEINFO_M[] = {
+    { "new",                   fileinfo_new },
+    { "get_name",              fileinfo_get_name },
+    { "get_display_name",      fileinfo_get_display_name },
+    { "get_file_type",         fileinfo_get_file_type },
+    { "get_attribute_boolean", fileinfo_get_attribute_boolean },
+    { "get_attribute_string",  fileinfo_get_attribute_string },
+    { NULL, NULL },
+};
+
+static const luaL_Reg FILEENUM_M[] = {
+    { "next_file",          fileenum_next_file },
+    { "next_files",         fileenum_next_files },
+    { "async_next_files",   fileenum_next_files },
+    { "get_child",          fileenum_get_child },
+    { "get_container",      fileenum_get_container },
+    { "has_pending",        fileenum_has_pending },
+    { "is_closed",          fileenum_is_closed },
+    { "close",              fileenum_close },
+    { "async_close",        fileenum_close },
+    { NULL, NULL },
+};
+
+/* ============================================================== GIOStreams */
+
+/*
+ * The shim has no glib dispatch of its own, so a DataInputStream must carry
+ * the pending read_line_async() result itself; read_line_finish() just hands
+ * it back. This mirrors the shape lib/awful/spawn.lua:236-262 and :505-545
+ * are written against: async read, then finish, no GAsyncReadyInterface.
+ */
+typedef struct {
+    GDataInputStream *stream;
+    gchar *pending;
+    gsize pending_len;
+    gboolean pending_is_error;
+} datain_ctx;
+
+static void
+d_datain(void *p)
+{
+    datain_ctx *c = (datain_ctx *)p;
+    if (!c)
+        return;
+    if (c->stream) {
+        g_input_stream_close((GInputStream *)c->stream, NULL, NULL);  /* idempotent */
+        g_object_unref(c->stream);
+    }
+    g_free(c->pending);
+    g_free(c);
+}
+
+static int
+datain_new(lua_State *L)
+{
+    GIOStream *inner = chk(L, 1);
+    datain_ctx *c;
+
+    if (g_object_is_floating(inner))
+        g_object_ref_sink(inner);
+    else
+        g_object_ref(inner);
+
+    c = (datain_ctx *)g_malloc0(sizeof(*c));
+    c->stream = g_data_input_stream_new((GInputStream *)inner);
+    return push_obj(L, c, d_datain, C_DATAIN);
+}
+
+static int
+datain_read_line(lua_State *L)
+{
+    datain_ctx *c = chk_cls(L, 1, C_DATAIN);
+    gchar *line;
+    gsize len = 0;
+    GError *err = NULL;
+
+    /* Returns char* (NULL at end of file); there is no success boolean. */
+    line = g_data_input_stream_read_line(c->stream, &len, NULL, &err);
+
+    if (err) {
+        lua_pushnil(L);
+        lua_pushstring(L, err->message);
+        g_error_free(err);
+        return 2;
+    }
+    if (line) {
+        lua_pushstring(L, line);
+        g_free(line);
+    } else {
+        lua_pushnil(L);                       /* end of file */
+    }
+    lua_pushinteger(L, (lua_Integer)len);
+    return 2;
+}
+
+/*
+ * read_line_async(priority, cancel, callback) -> runs inline and calls
+ * callback(obj, nil). lib/awful/spawn.lua:522-545 then calls
+ * obj:read_line_finish(res); the nil `res` is ignored, the stashed result is
+ * what gets returned.
+ */
+static int
+datain_read_line_async(lua_State *L)
+{
+    datain_ctx *c = chk_cls(L, 1, C_DATAIN);
+    gchar *line = NULL;
+    gsize len = 0;
+    GError *err = NULL;
+
+    luaL_checktype(L, 4, LUA_TFUNCTION);
+
+    line = g_data_input_stream_read_line(c->stream, &len, NULL, &err);
+    g_free(c->pending);
+    c->pending = NULL;
+    c->pending_len = 0;
+    c->pending_is_error = FALSE;
+    if (line) {
+        c->pending = line;
+        c->pending_len = len;
+    } else if (err) {
+        c->pending = g_strdup(err->message);
+        c->pending_is_error = TRUE;
+        g_error_free(err);
+    }
+    g_clear_error(&err);
+
+    lua_pushvalue(L, 4);                      /* callback */
+    lua_pushvalue(L, 1);                      /* the stream */
+    lua_pushnil(L);                           /* async result handle */
+    if (lua_pcall(L, 2, 0, 0) != 0) {
+        g_printerr("lgishim_gio callback error: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+static int
+datain_read_line_finish(lua_State *L)
+{
+    datain_ctx *c = chk_cls(L, 1, C_DATAIN);
+    gchar *pending = c->pending;
+
+    c->pending = NULL;
+    c->pending_len = 0;
+    if (!pending) {
+        lua_pushnil(L);
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+    if (c->pending_is_error) {
+        lua_pushnil(L);
+        lua_pushstring(L, pending);
+        g_free(pending);
+        return 2;
+    }
+    lua_pushstring(L, pending);
+    lua_pushinteger(L, (lua_Integer)c->pending_len);
+    g_free(pending);
+    return 2;
+}
+
+/* g_data_input_stream_set_buffer_size() is absent from this build. */
+static int
+datain_set_buffer_size(lua_State *L)
+{
+    (void)L;
+    return 0;
+}
+
+static int
+datain_close(lua_State *L)
+{
+    datain_ctx *c = chk_cls(L, 1, C_DATAIN);
+    /* c->stream is a GDataInputStream (a plain GInputStream), NOT a
+     * GIOStream -- g_io_stream_close() here is an assertion failure. */
+    if (c->stream)
+        g_input_stream_close((GInputStream *)c->stream, NULL, NULL);
+    return 0;
+}
+
+static int
+memin_new_from_data(lua_State *L)
+{
+    GInputStream *s;
+
+    if (lua_isstring(L, 1)) {
+        size_t len;
+        const char *data = luaL_checklstring(L, 1, &len);
+        s = g_memory_input_stream_new_from_data(data, (gssize)len, NULL);
+    } else {
+        /* The pre-2016 lgi form takes a table of characters; concatenate so
+         * the pcall fallback at lib/awful/spawn.lua:240-253 also works.
+         * Elements may be single-character strings or byte numbers. */
+        GString *acc = g_string_new(NULL);
+        lua_Integer n = luaL_len(L, 1);
+        lua_Integer i;
+        for (i = 1; i <= n; i++) {
+            lua_rawgeti(L, 1, i);
+            if (lua_isnumber(L, -1)) {
+                guint b = (guint)luaL_checknumber(L, -1);
+                g_string_append_c(acc, (char)(b & 0xffu));
+            } else {
+                size_t elen = 0;
+                const char *e = luaL_checklstring(L, -1, &elen);
+                g_string_append_len(acc, e, (gssize)elen);
+            }
+            lua_pop(L, 1);
+        }
+        s = g_memory_input_stream_new_from_data(acc->str, (gssize)acc->len, NULL);
+        g_string_free(acc, TRUE);
+    }
+    return push_obj(L, s, d_object, C_MEMIN);
+}
+
+static int
+memin_new(lua_State *L)
+{
+    lua_insert(L, 2);
+    return memin_new_from_data(L);
+}
+
+static int
+unixin_new(lua_State *L)
+{
+    gint fd = (gint)luaL_checkinteger(L, 1);
+    gboolean close_fd = lua_isnoneornil(L, 2) ? TRUE : lua_toboolean(L, 2);
+    GInputStream *s = g_unix_input_stream_new(fd, close_fd);
+
+    if (!s)
+        luaL_error(L, "lgishim_gio: could not open fd %d", fd);
+    if (g_object_is_floating(s))
+        g_object_ref_sink(s);
+    return push_obj(L, s, d_object, C_UNIXIN);
+}
+
+static int
+unixin_get_fd(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)g_unix_input_stream_get_fd(
+        (GUnixInputStream *)chk_cls(L, 1, C_UNIXIN)));
+    return 1;
+}
+
+static const luaL_Reg DATAIN_M[] = {
+    { "new",                datain_new },
+    { "read_line",          datain_read_line },
+    { "read_line_async",    datain_read_line_async },
+    { "read_line_finish",   datain_read_line_finish },
+    { "set_buffer_size",    datain_set_buffer_size },
+    { "close",              datain_close },
+    { NULL, NULL },
+};
+
+static const luaL_Reg MEMIN_M[] = {
+    { "new",            memin_new },
+    { "new_from_data",  memin_new_from_data },
+    { NULL, NULL },
+};
+
+static const luaL_Reg UNIXIN_M[] = {
+    { "new",    unixin_new },
+    { "get_fd", unixin_get_fd },
+    { NULL, NULL },
+};
+
+/* ============================================================ D-Bus */
+
+/*
+ * Classes and enums for lib/naughty/dbus.lua (session bus: own_name,
+ * register_object, emit_signal, proxy call_sync) and the menubar/gears
+ * async enumerator surface.
+ *
+ * Objects arrive from GLib callbacks, never from a constructor (except the
+ * FakeInfo builder classes), so the wrappers mostly re-wrap ref'd pointers
+ * handed to vtable handlers. register_object uses the VTABLE variant of
+ * g_dbus_connection_register_object() rather than the *_with_closures()
+ * GClosure path: gobject's closure_marshal() turns a boxed GValue into a
+ * plain lightuserdata and every GObject into its own generic wrapper, which
+ * would make parameters.value and invocation:return_value() unusable. The
+ * vtable callback builds the exact Lua argument list lib/ expects and
+ * dispatches it against the GClosure's cbdata (lua_State + registry ref),
+ * which lgishim_gobject.c stores at closure->data.
+ */
+
+/* --- FakeInfo builders (naughty/dbus.lua:396-432 table-init constructors) */
+
+typedef struct {
+    char *name;
+    char *signature;
+} farg;
+
+typedef struct {
+    char *name;
+    farg **in;
+    size_t nin;
+    farg **out;
+    size_t nout;
+} fmethod;
+
+typedef struct {
+    char *name;
+    farg **args;
+    size_t nargs;
+} fsignal;
+
+typedef struct {
+    GDBusNodeInfo *node;
+    GDBusInterfaceInfo *iface;
+} fiface;
+
+static void
+d_farg(void *p)
+{
+    farg *a = (farg *)p;
+    g_free(a->name);
+    g_free(a->signature);
+    g_free(a);
+}
+
+static void
+d_fmethod(void *p)
+{
+    fmethod *m = (fmethod *)p;
+    g_free(m->name);
+    g_free(m);          /* ->in / ->out are borrowed from arg wrappers */
+}
+
+static void
+d_fsignal(void *p)
+{
+    fsignal *s = (fsignal *)p;
+    g_free(s->name);
+    g_free(s);          /* ->args are borrowed from arg wrappers */
+}
+
+static void
+d_fiface(void *p)
+{
+    fiface *f = (fiface *)p;
+    if (f->iface)
+        g_dbus_interface_info_unref(f->iface);
+    if (f->node)
+        g_dbus_node_info_unref(f->node);
+    g_free(f);
+}
+
+static char *
+field_string(lua_State *L, int idx, const char *key)
+{
+    const char *s;
+
+    lua_getfield(L, idx, key);
+    s = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    return g_strdup(s ? s : "");
+}
+
+/* Parse an array of C_DBUSARG wrappers into a newly allocated farg** array
+ * of BORROWED pointers (the wrappers own their farg structs). */
+static farg **
+arg_array(lua_State *L, int idx, size_t *n)
+{
+    farg **arr = NULL;
+    size_t i, len = 0;
+
+    *n = 0;
+    if (!lua_istable(L, idx))
+        return NULL;
+    len = (size_t)lua_rawlen(L, idx);
+    if (len == 0)
+        return NULL;
+    arr = g_new0(farg *, len);
+    for (i = 0; i < len; i++) {
+        lua_rawgeti(L, idx, (lua_Integer)(i + 1));
+        arr[i] = (farg *)chk_cls(L, -1, C_DBUSARG);
+        lua_pop(L, 1);
+    }
+    *n = len;
+    return arr;
+}
+
+static int
+dbusarg_new(lua_State *L)
+{
+    farg *a;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    a = g_new0(farg, 1);
+    a->name = field_string(L, 1, "name");
+    a->signature = field_string(L, 1, "signature");
+    return push_obj(L, a, d_farg, C_DBUSARG);
+}
+
+static int
+dbusmethod_new(lua_State *L)
+{
+    fmethod *m;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    m = g_new0(fmethod, 1);
+    m->name = field_string(L, 1, "name");
+    lua_getfield(L, 1, "in_args");
+    m->in = arg_array(L, -1, &m->nin);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "out_args");
+    m->out = arg_array(L, -1, &m->nout);
+    lua_pop(L, 1);
+    return push_obj(L, m, d_fmethod, C_DBUSMETHOD);
+}
+
+static int
+dbussignal_new(lua_State *L)
+{
+    fsignal *s;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    s = g_new0(fsignal, 1);
+    s->name = field_string(L, 1, "name");
+    lua_getfield(L, 1, "args");
+    s->args = arg_array(L, -1, &s->nargs);
+    lua_pop(L, 1);
+    return push_obj(L, s, d_fsignal, C_DBUSSIGNAL);
+}
+
+/* Render one arg as <arg direction=".." type=".." name=".."/> */
+static void
+xml_arg(GString *x, const char *dir, farg *a)
+{
+    /* Signals carry no direction attribute; D-Bus XML rejects direction=''. */
+    g_string_append(x, "<arg type='");
+    xml_esc(x, a->signature);
+    g_string_append(x, "'");
+    if (dir && *dir) {
+        g_string_append(x, " direction='");
+        xml_esc(x, dir);
+        g_string_append(x, "'");
+    }
+    g_string_append(x, " name='");
+    xml_esc(x, a->name);
+    g_string_append(x, "'/>");
+}
+
+/*
+ * DBusInterfaceInfo{name=,methods={...},signals={...}} -> parse the table
+ * into D-Bus XML, hand it to g_dbus_node_info_new_for_xml() (2-param in this
+ * build), ref the matching interface and keep BOTH the node (anchor) and the
+ * ref'd interface alive until GC.
+ */
+static int
+dbusiface_new(lua_State *L)
+{
+    fiface *f;
+    GString *x;
+    GError *err = NULL;
+    char *iname;
+    size_t i;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    iname = field_string(L, 1, "name");
+    x = g_string_new("<node><interface name='");
+    xml_esc(x, iname);
+    g_string_append(x, "'>");
+
+    lua_getfield(L, 1, "methods");
+    if (lua_istable(L, -1)) {
+        for (i = 0; i < (size_t)lua_rawlen(L, -1); i++) {
+            fmethod *m;
+            size_t j;
+            lua_rawgeti(L, -1, (lua_Integer)(i + 1));
+            m = (fmethod *)chk_cls(L, -1, C_DBUSMETHOD);
+            lua_pop(L, 1);
+            g_string_append(x, "<method name='");
+            xml_esc(x, m->name);
+            g_string_append(x, "'>");
+            for (j = 0; j < m->nin; j++)
+                xml_arg(x, "in", m->in[j]);
+            for (j = 0; j < m->nout; j++)
+                xml_arg(x, "out", m->out[j]);
+            g_string_append(x, "</method>");
+        }
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "signals");
+    if (lua_istable(L, -1)) {
+        for (i = 0; i < (size_t)lua_rawlen(L, -1); i++) {
+            fsignal *s;
+            size_t j;
+            lua_rawgeti(L, -1, (lua_Integer)(i + 1));
+            s = (fsignal *)chk_cls(L, -1, C_DBUSSIGNAL);
+            lua_pop(L, 1);
+            g_string_append(x, "<signal name='");
+            xml_esc(x, s->name);
+            g_string_append(x, "'>");
+            for (j = 0; j < s->nargs; j++)
+                xml_arg(x, "", s->args[j]);
+            g_string_append(x, "</signal>");
+        }
+    }
+    lua_pop(L, 1);
+
+    g_string_append(x, "</interface></node>");
+
+    f = g_new0(fiface, 1);
+    f->node = g_dbus_node_info_new_for_xml(x->str, &err);
+    g_string_free(x, TRUE);
+    if (!f->node) {
+        g_free(f);
+        if (err)
+            g_printerr("lgishim_gio: g_dbus_node_info_new_for_xml: %s\n",
+                       err->message);
+        g_clear_error(&err);
+        g_free(iname);
+        lua_pushnil(L);
+        return 1;
+    }
+    f->iface = g_dbus_interface_info_ref(
+        g_dbus_node_info_lookup_interface(f->node, iname));
+    g_free(iname);
+    return push_obj(L, f, d_fiface, C_DBUSIFACE);
+}
+
+/* --- DBusVariant: wraps a GVariant*, exposing `.value` as a Lua table
+ * (field-style access via the "p" property-getter table). */
+
+static int
+dbusvar_new(lua_State *L)
+{
+    luaL_error(L, "lgishim_gio: DBusVariant is only produced by callbacks");
+    return 0;
+}
+
+/*
+ * `.value`: tuples and arrays keep their shape (Notify unpacks
+ * `parameters.value`; hints a{sv} is a dict table inside it); a scalar
+ * variant (e.g. the uint32 reply of GetConnectionUnixProcessID, which
+ * dbus.lua reads as `pid.value[1]`) is wrapped as { [1] = scalar }.
+ */
+static int
+dbusvar_get_value(lua_State *L)
+{
+    GVariant *v = (GVariant *)chk_cls(L, 1, C_DBUSVAR);
+
+    if (!v) {
+        lua_pushnil(L);
+        return 1;
+    }
+    switch (g_variant_classify(v)) {
+    case G_VARIANT_CLASS_TUPLE:
+    case G_VARIANT_CLASS_ARRAY:
+        variant_to_lua(L, v);
+        break;
+    default:
+        lua_newtable(L);
+        variant_to_lua(L, v);
+        lua_rawseti(L, -2, 1);
+        break;
+    }
+    return 1;
+}
+
+static int
+dbusvar_type_string(lua_State *L)
+{
+    GVariant *v = (GVariant *)chk_cls(L, 1, C_DBUSVAR);
+
+    lua_pushstring(L, v ? g_variant_get_type_string(v) : "");
+    return 1;
+}
+
+static int
+dbusvar_n_children(lua_State *L)
+{
+    GVariant *v = (GVariant *)chk_cls(L, 1, C_DBUSVAR);
+
+    lua_pushinteger(L, (lua_Integer)(v ? g_variant_n_children(v) : 0));
+    return 1;
+}
+
+/* --- DBusMethodInvocation */
+
+static int
+dbusinv_get_sender(lua_State *L)
+{
+    const char *s = g_dbus_method_invocation_get_sender(
+        (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV));
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+static int
+dbusinv_get_object_path(lua_State *L)
+{
+    const char *s = g_dbus_method_invocation_get_object_path(
+        (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+static int
+dbusinv_get_interface_name(lua_State *L)
+{
+    const char *s = g_dbus_method_invocation_get_interface_name(
+        (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+static int
+dbusinv_get_method_name(lua_State *L)
+{
+    const char *s = g_dbus_method_invocation_get_method_name(
+        (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+static int
+dbusinv_get_parameters(lua_State *L)
+{
+    GVariant *v = g_dbus_method_invocation_get_parameters(
+        (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV));
+
+    if (v)
+        return push_obj(L, g_variant_ref(v), d_variant, C_DBUSVAR);
+    lua_pushnil(L);
+    return 1;
+}
+
+/* return_value() does NOT take ownership of a non-floating variant, so the
+ * ref'd copy from variant_from_lua() is unref'd here in every path. */
+static int
+dbusinv_return_value(lua_State *L)
+{
+    GDBusMethodInvocation *inv = (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV);
+    GVariant *v = variant_from_lua(L, 2);
+
+    g_dbus_method_invocation_return_value(inv, v);
+    if (v)
+        g_variant_unref(v);
+    return 0;
+}
+
+static int
+dbusinv_return_error(lua_State *L)
+{
+    GDBusMethodInvocation *inv = (GDBusMethodInvocation *)chk_cls(L, 1, C_DBUSINV);
+    const char *domain = luaL_optstring(L, 2, "g-io-error-quark");
+    const char *message = luaL_optstring(L, 4, "");
+
+    g_dbus_method_invocation_return_error(inv, g_quark_from_string(domain),
+                                          (gint)luaL_optinteger(L, 3, 0),
+                                          "%s", message);
+    return 0;
+}
+
+/* --- DBusConnection (mostly produced by bus_own_name / bus_get callbacks) */
+
+static int
+dbusconn_call_sync(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+    GVariant *params = variant_from_lua(L, 6);
+    GVariantType *rt = NULL;
+    GVariant *reply = NULL;
+    GError *err = NULL;
+
+    if (lua_isstring(L, 7)) {
+        rt = g_variant_type_new(lua_tostring(L, 7));
+        lua_pop(L, 1);
+    }
+    reply = g_dbus_connection_call_sync(c,
+        lua_isnoneornil(L, 2) ? NULL : luaL_checkstring(L, 2),
+        luaL_checkstring(L, 3), luaL_checkstring(L, 4),
+        luaL_checkstring(L, 5), params, rt,
+        (GDBusCallFlags)flags_arg(L, 8, G_DBUS_CALL_FLAGS_NONE),
+        (gint)luaL_optinteger(L, 9, -1), NULL, &err);
+    if (params)
+        g_variant_unref(params);
+    if (rt)
+        g_variant_type_free(rt);
+    if (reply)
+        return push_obj(L, reply, d_variant, C_DBUSVAR);
+    lua_pushnil(L);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+dbusconn_emit_signal(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+    GVariant *params = variant_from_lua(L, 6);
+    GError *err = NULL;
+    gboolean ok = g_dbus_connection_emit_signal(c,
+        lua_isnoneornil(L, 2) ? NULL : luaL_checkstring(L, 2),
+        luaL_checkstring(L, 3), luaL_checkstring(L, 4),
+        luaL_checkstring(L, 5), params, &err);
+
+    if (params)
+        g_variant_unref(params);
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+/* --- vtable method-call dispatch (see module comment at the top of the
+ * D-Bus section: the GClosure is used only as a cbdata container). */
+
+static void
+gio_dbus_method_call(GDBusConnection *connection, const gchar *sender,
+                     const gchar *object_path, const gchar *interface_name,
+                     const gchar *method_name, GVariant *parameters,
+                     GDBusMethodInvocation *invocation, gpointer user_data)
+{
+    GClosure *cl = (GClosure *)user_data;
+    gobject_cbdata *cb;
+    lua_State *L;
+
+    if (!cl || cl->is_invalid)
+        return;
+    cb = (gobject_cbdata *)cl->data;
+    if (!cb || cb->ref == LUA_NOREF)
+        return;
+    L = cb->L;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, cb->ref);   /* fn */
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    if (connection)
+        push_obj(L, g_object_ref(connection), d_object, C_DBUSCONN);
+    else
+        lua_pushnil(L);
+    lua_pushstring(L, sender ? sender : "");
+    lua_pushstring(L, object_path ? object_path : "");
+    lua_pushstring(L, interface_name ? interface_name : "");
+    lua_pushstring(L, method_name ? method_name : "");
+    if (parameters) {
+        GVariant *p = g_variant_ref(parameters);
+        push_obj(L, p, d_variant, C_DBUSVAR);
+    } else {
+        lua_pushnil(L);
+    }
+    /* transfer-full ownership: rebind our ref, drop the passed-in one so
+     * that __gc unref + this unref balance to exactly zero. */
+    /* GDBusMethodInvocation is a GObject: ref/unref spellings were removed
+     * from newer GLib headers, use the object pair. */
+    push_obj(L, g_object_ref(invocation), d_object, C_DBUSINV);
+    g_object_unref(invocation);
+
+    /* [fn, conn, sender, path, iface, method, parameters, invocation] */
+    pcall_dispatch(L, 7);
+}
+
+static const GDBusInterfaceVTable dbus_vtable = {
+    .method_call = gio_dbus_method_call,
+    .get_property = NULL,
+    .set_property = NULL
+};
+
+static int
+dbusconn_register_object(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+    fiface *f = (fiface *)chk_cls(L, 3, C_DBUSIFACE);
+    GClosure *cl = g_closure_ref(lgishim_gobject_check_closure(L, 4));
+    GError *err = NULL;
+    guint id;
+
+    if (!f->iface) {
+        lua_pushboolean(L, FALSE);
+        lua_pushstring(L, "lgishim_gio: interface_info has no GDBusInterfaceInfo");
+        g_closure_unref(cl);
+        return 2;
+    }
+    id = g_dbus_connection_register_object(c, luaL_checkstring(L, 2),
+        f->iface, &dbus_vtable, (gpointer)cl,
+        (GDestroyNotify)g_closure_unref, &err);
+    if (id == 0) {
+        lua_pushboolean(L, FALSE);
+        push_error(L, err);
+        g_clear_error(&err);
+        g_closure_unref(cl);
+        return 2;
+    }
+    lua_pushinteger(L, (lua_Integer)id);
+    return 1;
+}
+
+static int
+dbusconn_close(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+
+    g_dbus_connection_close(c, NULL, NULL, NULL);
+    lua_pushboolean(L, TRUE);
+    return 1;
+}
+
+static int
+dbusconn_close_sync(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+    GError *err = NULL;
+    gboolean ok = g_dbus_connection_close_sync(c, NULL, &err);
+
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+dbusconn_is_closed(lua_State *L)
+{
+    lua_pushboolean(L, g_dbus_connection_is_closed(
+        (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN)) ? TRUE : FALSE);
+    return 1;
+}
+
+static int
+dbusconn_flush_sync(lua_State *L)
+{
+    GDBusConnection *c = (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN);
+    GError *err = NULL;
+    gboolean ok = g_dbus_connection_flush_sync(c, NULL, &err);
+
+    lua_pushboolean(L, ok ? TRUE : FALSE);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+dbusconn_get_unique_name(lua_State *L)
+{
+    const char *s = g_dbus_connection_get_unique_name(
+        (GDBusConnection *)chk_cls(L, 1, C_DBUSCONN));
+
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+/* --- DBusProxy */
+
+static int
+dbusproxy_new_for_bus_sync(lua_State *L)
+{
+    GDBusProxy *p;
+    GError *err = NULL;
+    fiface *f = NULL;
+    lua_Integer bus = luaL_optinteger(L, 1, G_BUS_TYPE_SESSION);
+    GDBusProxyFlags flags = (GDBusProxyFlags)flags_arg(L, 2, G_DBUS_PROXY_FLAGS_NONE);
+    const char *name = luaL_checkstring(L, 4);
+    const char *path = luaL_checkstring(L, 5);
+    const char *iface = luaL_checkstring(L, 6);
+
+    if (!lua_isnoneornil(L, 3))
+        f = (fiface *)chk_cls(L, 3, C_DBUSIFACE);
+    p = g_dbus_proxy_new_for_bus_sync((GBusType)bus, flags,
+        f ? f->iface : NULL, name, path, iface, NULL, &err);
+    if (!p) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, p, d_object, C_DBUSPROXY);
+}
+
+/* Async entry: lib/naughty/dbus.lua:439 calls it with a callback; without an
+ * event loop there is nothing to defer to, so resolve immediately through
+ * the sync path and hand the result (or nil, err) to the Lua callback. */
+static int
+dbusproxy_new_for_bus(lua_State *L)
+{
+    GDBusProxy *p;
+    GError *err = NULL;
+    fiface *f = NULL;
+    lua_Integer bus = luaL_optinteger(L, 1, G_BUS_TYPE_SESSION);
+    GDBusProxyFlags flags = (GDBusProxyFlags)flags_arg(L, 2, G_DBUS_PROXY_FLAGS_NONE);
+    const char *name = luaL_checkstring(L, 4);
+    const char *path = luaL_checkstring(L, 5);
+    const char *iface = luaL_checkstring(L, 6);
+
+    if (!lua_isnoneornil(L, 3))
+        f = (fiface *)chk_cls(L, 3, C_DBUSIFACE);
+    p = g_dbus_proxy_new_for_bus_sync((GBusType)bus, flags,
+        f ? f->iface : NULL, name, path, iface, NULL, &err);
+    lua_settop(L, 0);
+    lua_pushvalue(L, 8);                        /* callback */
+    if (!lua_isfunction(L, -1)) {
+        /* No callback: mirror the sync path's result pair. */
+        lua_pop(L, 1);
+        if (!p) {
+            lua_pushnil(L);
+            push_error(L, err);
+            g_clear_error(&err);
+            return 2;
+        }
+        return push_obj(L, p, d_object, C_DBUSPROXY);
+    }
+    if (!p) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        pcall_dispatch(L, 2);
+        return 0;
+    }
+    push_obj(L, p, d_object, C_DBUSPROXY);
+    pcall_dispatch(L, 1);
+    return 0;
+}
+
+static int
+dbusproxy_call_sync(lua_State *L)
+{
+    GDBusProxy *p = (GDBusProxy *)chk_cls(L, 1, C_DBUSPROXY);
+    GVariant *params = variant_from_lua(L, 3);
+    GVariant *reply;
+    GError *err = NULL;
+
+    reply = g_dbus_proxy_call_sync(p, luaL_checkstring(L, 2), params,
+        (GDBusCallFlags)flags_arg(L, 4, G_DBUS_CALL_FLAGS_NONE),
+        (gint)luaL_optinteger(L, 5, -1), NULL, &err);
+    if (params)
+        g_variant_unref(params);
+    if (reply)
+        return push_obj(L, reply, d_variant, C_DBUSVAR);
+    lua_pushnil(L);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+dbusproxy_get_name(lua_State *L)
+{
+    const char *s = g_dbus_proxy_get_name((GDBusProxy *)chk_cls(L, 1, C_DBUSPROXY));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+static int
+dbusproxy_get_object_path(lua_State *L)
+{
+    const char *s = g_dbus_proxy_get_object_path((GDBusProxy *)chk_cls(L, 1, C_DBUSPROXY));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+static int
+dbusproxy_get_interface_name(lua_State *L)
+{
+    const char *s = g_dbus_proxy_get_interface_name((GDBusProxy *)chk_cls(L, 1, C_DBUSPROXY));
+    lua_pushstring(L, s ? s : "");
+    return 1;
+}
+
+/* --- module-level bus functions */
+
+typedef struct {
+    GClosure *acquired;
+    GClosure *name_acquired;
+    GClosure *name_lost;
+} bown;
+
+static void
+d_bown(void *p)
+{
+    bown *b = (bown *)p;
+
+    if (b->acquired)
+        g_closure_unref(b->acquired);
+    if (b->name_acquired)
+        g_closure_unref(b->name_acquired);
+    if (b->name_lost)
+        g_closure_unref(b->name_lost);
+    g_free(b);
+}
+
+/* Build (conn-or-nil, name) and dispatch against closure's cbdata. */
+static void
+dispatch_bus_cb(GClosure *cl, GDBusConnection *conn, const gchar *name)
+{
+    gobject_cbdata *cb;
+    lua_State *L;
+
+    if (!cl || cl->is_invalid)
+        return;
+    cb = (gobject_cbdata *)cl->data;
+    if (!cb || cb->ref == LUA_NOREF)
+        return;
+    L = cb->L;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, cb->ref);   /* fn */
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    if (conn)
+        push_obj(L, g_object_ref(conn), d_object, C_DBUSCONN);
+    else
+        lua_pushnil(L);
+    lua_pushstring(L, name ? name : "");
+    lua_insert(L, 1);                              /* [fn, conn, name] */
+    pcall_dispatch(L, 2);
+}
+
+static void
+bus_acquired_cb(GDBusConnection *connection, const gchar *name, gpointer ud)
+{
+    dispatch_bus_cb(((bown *)ud)->acquired, connection, name);
+}
+
+static void
+bus_name_acquired_cb(GDBusConnection *connection, const gchar *name, gpointer ud)
+{
+    dispatch_bus_cb(((bown *)ud)->name_acquired, connection, name);
+}
+
+static void
+bus_name_lost_cb(GDBusConnection *connection, const gchar *name, gpointer ud)
+{
+    dispatch_bus_cb(((bown *)ud)->name_lost, connection, name);
+}
+
+static int
+gio_bus_own_name(lua_State *L)
+{
+    bown *b = g_new0(bown, 1);
+    guint id;
+
+    b->acquired = g_closure_ref(lgishim_gobject_check_closure(L, 4));
+    b->name_acquired = g_closure_ref(lgishim_gobject_check_closure(L, 5));
+    b->name_lost = g_closure_ref(lgishim_gobject_check_closure(L, 6));
+    id = g_bus_own_name((GBusType)luaL_optinteger(L, 1, G_BUS_TYPE_SESSION),
+        luaL_checkstring(L, 2),
+        (GBusNameOwnerFlags)flags_arg(L, 3, G_BUS_NAME_OWNER_FLAGS_NONE),
+        bus_acquired_cb, bus_name_acquired_cb, bus_name_lost_cb,
+        (gpointer)b, (GDestroyNotify)d_bown);
+    lua_pushinteger(L, (lua_Integer)id);
+    return 1;
+}
+
+static int
+gio_bus_get_sync(lua_State *L)
+{
+    GDBusConnection *c;
+    GError *err = NULL;
+
+    c = g_bus_get_sync((GBusType)luaL_optinteger(L, 1, G_BUS_TYPE_SESSION),
+        NULL, &err);
+    if (!c) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, c, d_object, C_DBUSCONN);
+}
+
+static int
+gio_bus_get(lua_State *L)
+{
+    GDBusConnection *c;
+    GError *err = NULL;
+
+    c = g_bus_get_sync((GBusType)luaL_optinteger(L, 1, G_BUS_TYPE_SESSION),
+        NULL, &err);
+    lua_settop(L, 0);
+    lua_pushvalue(L, 2);                        /* callback */
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        if (!c) {
+            lua_pushnil(L);
+            push_error(L, err);
+            g_clear_error(&err);
+            return 2;
+        }
+        return push_obj(L, c, d_object, C_DBUSCONN);
+    }
+    if (!c) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        pcall_dispatch(L, 2);
+        return 0;
+    }
+    push_obj(L, c, d_object, C_DBUSCONN);
+    pcall_dispatch(L, 1);
+    return 0;
+}
+
+/* --- Gio.Async (start only): menubar/utils.lua:407 does
+ *   gio.Async.start(do_protected_call)(function() ... end)
+ * The real LGI version schedules a GTask; with no main loop to defer to,
+ * running the task immediately inside do_protected_call() is equivalent
+ * from the caller's point of view (results arrive before call_callback). */
+
+static int
+gio_async_run(lua_State *L)
+{
+    lua_pushvalue(L, lua_upvalueindex(1));      /* task (do_protected_call) */
+    lua_insert(L, 1);
+    lua_call(L, lua_gettop(L) - 1, 0);          /* task(body) */
+    return 0;
+}
+
+static int
+gio_async_start(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_pushvalue(L, 1);
+    lua_pushcclosure(L, gio_async_run, 1);
+    return 1;
+}
+
+/* --- class/enum tables */
+
+static const luaL_Reg DBUSVAR_M[] = {
+    { "new",         dbusvar_new },
+    { "type_string", dbusvar_type_string },
+    { "n_children",  dbusvar_n_children },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSVAR_P[] = {
+    { "value", dbusvar_get_value },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSINV_M[] = {
+    { "get_sender",         dbusinv_get_sender },
+    { "get_object_path",    dbusinv_get_object_path },
+    { "get_interface_name", dbusinv_get_interface_name },
+    { "get_method_name",    dbusinv_get_method_name },
+    { "get_parameters",     dbusinv_get_parameters },
+    { "return_value",       dbusinv_return_value },
+    { "return_error",       dbusinv_return_error },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSCONN_M[] = {
+    { "call_sync",      dbusconn_call_sync },
+    { "emit_signal",    dbusconn_emit_signal },
+    { "register_object", dbusconn_register_object },
+    { "close",          dbusconn_close },
+    { "close_sync",     dbusconn_close_sync },
+    { "is_closed",      dbusconn_is_closed },
+    { "flush_sync",     dbusconn_flush_sync },
+    { "get_unique_name", dbusconn_get_unique_name },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSPROXY_M[] = {
+    { "new_for_bus",         dbusproxy_new_for_bus },
+    { "new_for_bus_sync",    dbusproxy_new_for_bus_sync },
+    { "call_sync",           dbusproxy_call_sync },
+    { "get_name",            dbusproxy_get_name },
+    { "get_object_path",     dbusproxy_get_object_path },
+    { "get_interface_name",  dbusproxy_get_interface_name },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSARG_M[] = {
+    { "new", dbusarg_new },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSMETHOD_M[] = {
+    { "new", dbusmethod_new },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSSIGNAL_M[] = {
+    { "new", dbussignal_new },
+    { NULL, NULL },
+};
+
+static const luaL_Reg DBUSIFACE_M[] = {
+    { "new", dbusiface_new },
+    { NULL, NULL },
+};
+
+static const struct enumpair FILE_TYPES[] = {
+    { "UNKNOWN",       G_FILE_TYPE_UNKNOWN },
+    { "REGULAR",       G_FILE_TYPE_REGULAR },
+    { "DIRECTORY",     G_FILE_TYPE_DIRECTORY },
+    { "SYMBOLIC_LINK", G_FILE_TYPE_SYMBOLIC_LINK },
+    { "SPECIAL",       G_FILE_TYPE_SPECIAL },
+    { "SHORTCUT",      G_FILE_TYPE_SHORTCUT },
+    { "MOUNTABLE",     G_FILE_TYPE_MOUNTABLE },
+};
+
+static const struct enumpair FILE_ATTRIBUTE_TYPES[] = {
+    { "INVALID",    G_FILE_ATTRIBUTE_TYPE_INVALID },
+    { "STRING",     G_FILE_ATTRIBUTE_TYPE_STRING },
+    { "BYTE_STRING", G_FILE_ATTRIBUTE_TYPE_BYTE_STRING },
+    { "BOOLEAN",    G_FILE_ATTRIBUTE_TYPE_BOOLEAN },
+    { "UINT32",     G_FILE_ATTRIBUTE_TYPE_UINT32 },
+    { "INT32",      G_FILE_ATTRIBUTE_TYPE_INT32 },
+    { "UINT64",     G_FILE_ATTRIBUTE_TYPE_UINT64 },
+    { "INT64",      G_FILE_ATTRIBUTE_TYPE_INT64 },
+    { "STRINGV",    G_FILE_ATTRIBUTE_TYPE_STRINGV },
+    { "OBJECT",     G_FILE_ATTRIBUTE_TYPE_OBJECT },
+};
+
+/* --- module entry point */
+
+int
+luaopen_lgishim_gio(lua_State *L)
+{
+    lua_newtable(L);                           /* module table */
+
+    /* make_class_table() leaves the class table on top of the stack, so each
+     * class_setup() must be followed by a setfield that pops it into the module
+     * table -- exactly the lgishim_gobject luaopen pattern.  Without the
+     * setfield the module table is never populated and `return 1` hands back
+     * the last class table instead, leaving Gio.DBusProxy & co. nil. */
+    class_setup(L, C_FILE,        FILE_M, NULL);
+    lua_setfield(L, -2, "File");
+    class_setup(L, C_FILEINFO,    FILEINFO_M, NULL);
+    lua_setfield(L, -2, "FileInfo");
+    class_setup(L, C_FILEENUM,    FILEENUM_M, NULL);
+    lua_setfield(L, -2, "FileEnumerator");
+    class_setup(L, C_DATAIN,      DATAIN_M, NULL);
+    lua_setfield(L, -2, "DataInputStream");
+    class_setup(L, C_MEMIN,       MEMIN_M, NULL);
+    lua_setfield(L, -2, "MemoryInputStream");
+    class_setup(L, C_UNIXIN,      UNIXIN_M, NULL);
+    lua_setfield(L, -2, "UnixInputStream");
+    class_setup(L, C_DBUSCONN,    DBUSCONN_M, NULL);
+    lua_setfield(L, -2, "DBusConnection");
+    class_setup(L, C_DBUSPROXY,   DBUSPROXY_M, NULL);
+    lua_setfield(L, -2, "DBusProxy");
+    class_setup(L, C_DBUSINV,     DBUSINV_M, NULL);
+    lua_setfield(L, -2, "DBusMethodInvocation");
+    class_setup(L, C_DBUSVAR,     DBUSVAR_M, DBUSVAR_P);
+    lua_setfield(L, -2, "DBusVariant");
+    class_setup(L, C_DBUSARG,     DBUSARG_M, NULL);
+    lua_setfield(L, -2, "DBusArgInfo");
+    class_setup(L, C_DBUSMETHOD,  DBUSMETHOD_M, NULL);
+    lua_setfield(L, -2, "DBusMethodInfo");
+    class_setup(L, C_DBUSSIGNAL,  DBUSSIGNAL_M, NULL);
+    lua_setfield(L, -2, "DBusSignalInfo");
+    class_setup(L, C_DBUSIFACE,   DBUSIFACE_M, NULL);
+    lua_setfield(L, -2, "DBusInterfaceInfo");
+
+    install_enum(L, "BusType", BUS_TYPES, G_N_ELEMENTS(BUS_TYPES));
+    install_enum(L, "BusNameOwnerFlags", BUS_NAME_OWNER_FLAGS,
+                 G_N_ELEMENTS(BUS_NAME_OWNER_FLAGS));
+    install_enum(L, "DBusProxyFlags", DBUS_PROXY_FLAGS,
+                 G_N_ELEMENTS(DBUS_PROXY_FLAGS));
+    install_enum(L, "DBusCallFlags", DBUS_CALL_FLAGS,
+                 G_N_ELEMENTS(DBUS_CALL_FLAGS));
+    install_enum(L, "FileQueryInfoFlags", FILE_QUERY_INFO_FLAGS,
+                 G_N_ELEMENTS(FILE_QUERY_INFO_FLAGS));
+    install_enum(L, "FileType", FILE_TYPES,
+                 G_N_ELEMENTS(FILE_TYPES));
+    install_enum(L, "FileAttributeType", FILE_ATTRIBUTE_TYPES,
+                 G_N_ELEMENTS(FILE_ATTRIBUTE_TYPES));
+
+    /* IOErrorEnum is the domain NAME string: gears/filesystem.lua:22 tests
+     * `err.domain == Gio.IOErrorEnum`, i.e. the string "Gio.IOErrorEnum"
+     * against the string push_error() emits. An install_enum() table would
+     * never equal it. */
+    lua_pushstring(L, "Gio.IOErrorEnum");
+    lua_setfield(L, -2, "IOErrorEnum");
+
+    /* Module-level constants menubar/utils.lua:370-371 reads directly. */
+    lua_pushstring(L, "standard::name");
+    lua_setfield(L, -2, "FILE_ATTRIBUTE_STANDARD_NAME");
+    lua_pushstring(L, "standard::type");
+    lua_setfield(L, -2, "FILE_ATTRIBUTE_STANDARD_TYPE");
+
+    lua_pushcfunction(L, gio_bus_get);
+    lua_setfield(L, -2, "bus_get");
+    lua_pushcfunction(L, gio_bus_get_sync);
+    lua_setfield(L, -2, "bus_get_sync");
+    lua_pushcfunction(L, gio_bus_own_name);
+    lua_setfield(L, -2, "bus_own_name");
+
+    lua_newtable(L);
+    lua_pushcfunction(L, gio_async_start);
+    lua_setfield(L, -2, "start");
+    lua_setfield(L, -2, "Async");
+
+    return 1;
+}
