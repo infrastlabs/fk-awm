@@ -138,7 +138,7 @@ local surface    = require( "gears.surface"             )
 local base       = require( "wibox.widget.base"         )
 local background = require( "wibox.container.background")
 local beautiful  = require( "beautiful"                 )
-local cairo      = require( "lgi" ).cairo
+local cairo      = require("vendor.lgishim").cairo
 local draw       = require( "wibox.widget" ).draw_to_cairo_context
 local grect      = require( "gears.geometry" ).rectangle
 

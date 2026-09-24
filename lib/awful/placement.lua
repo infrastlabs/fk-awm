@@ -97,7 +97,7 @@ local grect = require("gears.geometry").rectangle
 local gdebug = require("gears.debug")
 local gmath = require("gears.math")
 local gtable = require("gears.table")
-local cairo = require( "lgi" ).cairo
+local cairo = require("vendor.lgishim").cairo
 local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility with Lua 5.1)
 
 local function get_screen(s)
