@@ -20,10 +20,10 @@
  *     because wibox/widget/textbox.lua compares the getter result against the
  *     same strings it passes to the setter.
  *
- * Not part of this spike (needs Pango >= 1.50, reimplementable on top of
- * pango_layout_get_extents()): pango_layout_get_preferred_size,
- * get_preferred_size_at_dpi, get_height_for_width, get_height_for_width_at_dpi.
- * lib/ reaches for those only through wibox/container/place.lua, never here.
+ * Layout measurement API (get_extents/get_size/get_baseline/get_line_count)
+ * added in Phase 2 Part 7. get_extents is the Pango-units counterpart of
+ * get_pixel_extents; lib/ uses get_pixel_extents exclusively for text
+ * measurement (textbox.lua:45,57,554).
  */
 
 #include <lauxlib.h>
@@ -375,6 +375,48 @@ static int l_get_pixel_extents(lua_State *L)
     return 2;
 }
 
+/*
+ * Pango-units counterpart of get_pixel_extents. Returns (ink, logical)
+ * rectangles in Pango units (1/1024 px). On Pango >= 1.50 this delegates to
+ * pango_layout_get_preferred_size(), which has the same signature.
+ */
+static int l_get_extents(lua_State *L)
+{
+    PangoRectangle ink, logical;
+#if PANGO_VERSION_MAJOR * 100 + PANGO_VERSION_MINOR >= 150
+    pango_layout_get_preferred_size(chk(L, 1), &ink, &logical);
+#else
+    pango_layout_get_extents(chk(L, 1), &ink, &logical);
+#endif
+    push_rect(L, &ink);
+    push_rect(L, &logical);
+    return 2;
+}
+
+/* Returns (width, height) in Pango units. */
+static int l_get_size(lua_State *L)
+{
+    int width = 0, height = 0;
+    pango_layout_get_size(chk(L, 1), &width, &height);
+    lua_pushinteger(L, width);
+    lua_pushinteger(L, height);
+    return 2;
+}
+
+/* Returns the baseline from the top in Pango units, or 0 if no baseline. */
+static int l_get_baseline(lua_State *L)
+{
+    lua_pushinteger(L, pango_layout_get_baseline(chk(L, 1)));
+    return 1;
+}
+
+/* Returns the number of lines (paragraphs) in the layout. */
+static int l_get_line_count(lua_State *L)
+{
+    lua_pushinteger(L, pango_layout_get_line_count(chk(L, 1)));
+    return 1;
+}
+
 static int l_context_changed(lua_State *L)
 {
     pango_layout_context_changed(chk(L, 1));
@@ -405,6 +447,10 @@ static const luaL_Reg LAYOUT_M[] = {
     { "get_alignment", l_get_alignment },
     { "get_line_spacing", l_get_line_spacing },
     { "get_pixel_extents", l_get_pixel_extents },
+    { "get_extents", l_get_extents },
+    { "get_size", l_get_size },
+    { "get_baseline", l_get_baseline },
+    { "get_line_count", l_get_line_count },
     { "context_changed", l_context_changed },
     { NULL, NULL },
 };
@@ -502,30 +548,42 @@ static const luaL_Reg COLOR_M[] = {
  * :get_red() calls), so they have to resolve through m_index's property path
  * rather than the method table.
  *
- * In Pango 1.48 PangoColor is a public struct with no accessor functions, so
- * the fields are read directly. Since 1.50 the struct is opaque and
- * pango_color_get_red() etc. exist; there is also no alpha field at all
- * (only pango_color_parse_with_alpha()), so `c.alpha` is intentionally left
- * unimplemented -- it reads as nil, which is what any missing property does.
+ * PangoColor is a public struct on 1.48 (direct field access); on 1.50+ it
+ * is opaque and pango_color_get_red() etc. are the only access path. The
+ * #if branch picks the right one at compile time. `c.alpha` is intentionally
+ * left unimplemented -- it reads as nil, which is what any missing property
+ * does.
  */
 static int
 co_get_red(lua_State *L)
 {
+#if PANGO_VERSION_MAJOR * 100 + PANGO_VERSION_MINOR >= 150
+    lua_pushinteger(L, pango_color_get_red((const PangoColor *)chk(L, 1)));
+#else
     lua_pushinteger(L, ((PangoColor *)chk(L, 1))->red);
+#endif
     return 1;
 }
 
 static int
 co_get_green(lua_State *L)
 {
+#if PANGO_VERSION_MAJOR * 100 + PANGO_VERSION_MINOR >= 150
+    lua_pushinteger(L, pango_color_get_green((const PangoColor *)chk(L, 1)));
+#else
     lua_pushinteger(L, ((PangoColor *)chk(L, 1))->green);
+#endif
     return 1;
 }
 
 static int
 co_get_blue(lua_State *L)
 {
+#if PANGO_VERSION_MAJOR * 100 + PANGO_VERSION_MINOR >= 150
+    lua_pushinteger(L, pango_color_get_blue((const PangoColor *)chk(L, 1)));
+#else
     lua_pushinteger(L, ((PangoColor *)chk(L, 1))->blue);
+#endif
     return 1;
 }
 
