@@ -836,10 +836,27 @@ static const luaL_Reg MATRIX_M[] = {
 static int surface_wrap(lua_State *L)
 {
     /* cairo.Surface(obj, copy) -- the generic converter used by
-     * gears/surface.lua:72. nil -> nothing; a Surface userdata -> that
-     * surface; a string -> a load failure is not our problem here. */
+     * gears/surface.lua:72. nil -> nothing; an already-wrapped Surface ->
+     * that surface; a lightuserdatum (the raw cairo_surface_t * pushed by
+     * capi.awesome.pixbuf_to_surface, luaa.c:330) -> wrapped, since lua
+     * owns the ref there (luaa.c:329) and is the one that must free it.
+     *
+     * The lightuserdatum branch is load-bearing, not cosmetic: gears/
+     * surface.lua:67 returns early only when cairo.Surface:is_type_of()
+     * passes, and is_type_of() compares metatable identity (m_is_type_of)
+     * -- a lightuserdatum has none, so it always fails and every pixbuf-
+     * loaded image falls through to cairo.Surface(lu, true) here. Passing
+     * the pointer back as-is used to hand imagebox.lua:112 a lightuserdatum
+     * and die in `surf.width` with "attempt to index a userdata value". */
     if (lua_isnil(L, 1))
         return 0;
+    if (lua_islightuserdata(L, 1)) {
+        cairo_surface_t *s = lua_touserdata(L, 1);
+
+        if (!s)
+            return luaL_error(L, "lgishim: cairo.Surface(): NULL surface");
+        return push_obj(L, s, d_surface, C_SURFACE);
+    }
     if (lua_isuserdata(L, 1)) {
         lua_pushvalue(L, 1);
         return 1;

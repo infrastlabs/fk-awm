@@ -578,6 +578,33 @@ push_error(lua_State *L, GError *err)
 }
 
 /*
+ * Push `debug.traceback` onto the stack as a pcall message handler and return
+ * its stack index. A raised callback error must be captured while the callback
+ * is still on the stack: once pcall returns, it is already unwound, so a bare
+ * "attempt to call a string value" would never say which lib/ frame raised.
+ * Returns 0 (plain message, no handler) when debug.traceback is absent.
+ */
+static int
+push_traceback_h(lua_State *L)
+{
+    int idx;
+
+    lua_getglobal(L, "debug");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_getfield(L, -1, "traceback");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return 0;
+    }
+    idx = lua_gettop(L) - 1;
+    lua_remove(L, idx);                   /* drop the debug table */
+    return idx;
+}
+
+/*
  * Call a Lua function that GLib dispatched, catching raises. The tail has to
  * be left empty because the callback shares the lua_State with the event
  * loop (see lgishim_gobject.c's closure_marshal()).
@@ -585,7 +612,7 @@ push_error(lua_State *L, GError *err)
 static void
 pcall_dispatch(lua_State *L, int nargs)
 {
-    if (lua_pcall(L, nargs, 1, 0) != 0) {
+    if (lua_pcall(L, nargs, 1, push_traceback_h(L)) != 0) {
         g_printerr("lgishim_gio callback error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     } else {
@@ -1226,8 +1253,9 @@ datain_read_line_async(lua_State *L)
     lua_pushvalue(L, 4);                      /* callback */
     lua_pushvalue(L, 1);                      /* the stream */
     lua_pushnil(L);                           /* async result handle */
-    if (lua_pcall(L, 2, 0, 0) != 0) {
-        g_printerr("lgishim_gio callback error: %s\n", lua_tostring(L, -1));
+    if (lua_pcall(L, 2, 0, push_traceback_h(L)) != 0) {
+        g_printerr("lgishim_gio read_line_async error: %s\n",
+                   lua_tostring(L, -1));
         lua_pop(L, 1);
     }
     return 0;
