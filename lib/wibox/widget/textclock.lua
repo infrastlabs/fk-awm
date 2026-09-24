@@ -157,7 +157,10 @@ local function new(format, refresh, tzid)
         return true -- Continue the timer
     end
 
-    w._timer = timer.weak_start_new(refresh, w._private.textclock_update_cb)
+    -- w._private.refresh, not `refresh`: the constructor default (60) is
+    -- resolved above and `refresh` is still nil for default callers, which
+    -- would hand the timer a 0 interval.
+    w._timer = timer.weak_start_new(w._private.refresh, w._private.textclock_update_cb)
     w:force_update()
     return w
 end
