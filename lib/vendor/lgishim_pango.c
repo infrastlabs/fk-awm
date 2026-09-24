@@ -651,15 +651,19 @@ static const luaL_Reg FONTMAP_M[] = {
 
 static int cx_new(lua_State *L)
 {
-    /* pango_context_new() returns a context with no font map and no font
-     * backend on this Pango 1.48 build. Any fontset load then goes through
-     * pango_context_load_fontset() -> the deprecated stub
-     * pango_font_map_load_fontset(NULL, ...), which only warns
-     * "assertion 'fontmap != NULL' failed" and returns NULL, so a layout pass
-     * retries it forever: a hot loop that also spews g_object_get_qdata
-     * criticals and never returns. Tie the context to the default font map
-     * instead -- what pango_cairo_create_layout() does -- and the same call
-     * gives ink=37x12 for "Hello" with zero criticals. */
+    /* Bind the context to the default font map -- what pango_cairo_create_layout()
+     * does -- instead of leaving it font-map-less. A bare context gets a NULL
+     * font_map, so every fontset load goes through pango_context_load_fontset()
+     * -> the deprecated stub pango_font_map_load_fontset(NULL, ...), which only
+     * warns "assertion 'fontmap != NULL' failed" and returns NULL; a layout built
+     * on that context can never shape text.
+     *
+     * Note: pango_cairo_font_map_get_default() is a borrowed, per-thread pango
+     * singleton -- see pc_font_map_get_default() for why wrapping *that* in a
+     * freeing destructor was the GLib-GObject-CRITICAL flood. Calling it here
+     * and passing the pointer straight through is safe: nothing is owned by us.
+     * d_unref on the returned context is correct, and the context refs the font
+     * map, so the map survives past this call. */
     return push_obj(L, pango_font_map_create_context(
                    (PangoFontMap *)pango_cairo_font_map_get_default()),
                     d_unref, C_CONTEXT);
@@ -982,7 +986,20 @@ luaopen_lgishim_pango(lua_State *L)
 static int
 pc_font_map_get_default(lua_State *L)
 {
-    return push_obj(L, pango_cairo_font_map_get_default(), d_unref,
+    /* BORROWED, never freed by us. Pango 1.48 caches this in a per-thread
+     * g_private and documents it as "(transfer none): owned by Pango and must
+     * not be freed". Handing it to d_unref (g_object_unref) was the runtime
+     * flood: PangoFontMap is a real GObject here (G_DEFINE_ABSTRACT_TYPE_WITH_CODE
+     * ... G_TYPE_OBJECT), so the wrap dropped the singleton's only ref the
+     * moment the Lua temporary was collected. Pango's g_private then kept a
+     * dangling pointer, pango_cairo_font_map_get_default() handed the freed
+     * object back out forever, pango_font_map_create_context() warned and
+     * stored the garbage in context->font_map, and pango/itemize.c
+     * get_font_cache() spammed `g_object_get_qdata` / `g_object_replace_qdata`
+     * `G_IS_OBJECT (object)' criticals in its `goto retry' loop at ~11 MB/s.
+     * A context or layout built from it stays alive because it refs the font
+     * map itself, so d_noop leaks nothing. */
+    return push_obj(L, pango_cairo_font_map_get_default(), d_noop,
                     C_FONTMAP);
 }
 
