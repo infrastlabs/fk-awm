@@ -48,10 +48,20 @@ local policies_to_extents = {
     ["reflect"] = cairo.Extend.REFLECT,
 }
 
--- Safe load for optional Rsvg module
+-- Safe load for optional Rsvg module.
+-- An unavailable backend may expose the module as an *empty* table instead of
+-- raising. An empty table is truthy, so truthiness alone is not enough: only a
+-- module that actually provides the API used below counts as loaded, otherwise
+-- the `if not Rsvg` guards further down are bypassed and `Rsvg.Handle`
+-- dereferences nil.
 local Rsvg = nil
 do
-    local success, err = pcall(function() Rsvg = lgi.Rsvg end)
+    local success, err = pcall(function()
+        local mod = lgi.Rsvg
+        if type(mod) == "table" and mod.Handle then
+            Rsvg = mod
+        end
+    end)
     if not success then
         gdebug.print_warning(debug.traceback("Could not load Rsvg: " .. tostring(err)))
     end
