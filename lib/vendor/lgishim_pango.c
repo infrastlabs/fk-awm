@@ -42,6 +42,10 @@ typedef struct lua_State lua_State;
 int luaopen_lgishim_pango(lua_State *L);
 int luaopen_lgishim_pangocairo(lua_State *L);
 
+/* Exported to lgishim_cairo.c for Context:show_layout()/update_layout(). */
+typedef struct _PangoLayout PangoLayout;
+PangoLayout *lgishim_pango_check_layout(lua_State *L, int idx);
+
 enum {
     C_ATTRLIST = 1,
     C_LAYOUT,
@@ -55,16 +59,27 @@ enum {
 
 static const char *CLS_NAMES[N_CLASSES] = {
     NULL,
-    "lgishim.AttrList",
-    "lgishim.Layout",
-    "lgishim.FontDescription",
-    "lgishim.Color",
-    "lgishim.FontMap",
-    "lgishim.Context",
-    "lgishim.FontMetrics",
+    "lgishim_pango.AttrList",
+    "lgishim_pango.Layout",
+    "lgishim_pango.FontDescription",
+    "lgishim_pango.Color",
+    "lgishim_pango.FontMap",
+    "lgishim_pango.Context",
+    "lgishim_pango.FontMetrics",
 };
 
-#define REG_CLASSES "lgishim_classes"
+/* Both this module and lgishim_cairo.c must own their own metatable names and
+ * their own REG_CLASSES array. luaL_newmetatable() adopts an already-registered
+ * name rather than creating one, so when pango's Context and cairo's Context
+ * both claimed "lgishim.Context" -- cairo loads after pango, see lgishim.lua --
+ * cairo's class_setup silently took over pango's metatable, overwriting its
+ * __index/__newindex/__gc/finish and installing cairo's Context methods on top.
+ * A pango_context_t asked for set_resolution through that metatable was looked
+ * up as a cairo_t, and the method resolved to nil. m_index also indexes
+ * REG_CLASSES by the per-module class number, so the numeric ids collide as
+ * well (pango C_CONTEXT=6 vs cairo C_REGION=6); the registry key has to be
+ * split for that reason too, not only the metatable names. */
+#define REG_CLASSES "lgishim_pango_classes"
 
 typedef struct {
     void *p;
@@ -128,6 +143,31 @@ chk(lua_State *L, int idx)
         luaL_error(L, "lgishim: expected object at arg %d, got %s",
                    idx, lua_isnil(L, idx) ? "nil" : luaL_typename(L, idx));
     return w->p;
+}
+
+/* Exported to lgishim_cairo.c, which implements cairo.Context:show_layout() and
+ * update_layout() against a Pango.Layout built here. w->cls alone is not a
+ * sound identifier: the per-module class numbers collide (pango C_LAYOUT=2 is
+ * cairo C_SURFACE=2) even with the REG_CLASSES split, so a cairo.Surface would
+ * otherwise pass as a layout. Compare metatable identity too -- the same idiom
+ * as the cairo shim's is_type_of. Returns NULL instead of raising so the caller
+ * can say what it was expecting. */
+PangoLayout *
+lgishim_pango_check_layout(lua_State *L, int idx)
+{
+    wrap *w = getud(L, idx);
+
+    if (!w || w->cls != C_LAYOUT)
+        return NULL;
+    luaL_getmetatable(L, CLS_NAMES[C_LAYOUT]);
+    lua_pushvalue(L, idx);
+    lua_getmetatable(L, -1);                  /* [.., mt1, ud, udmt] */
+    if (lua_isnil(L, -1) || !lua_rawequal(L, -1, -3)) {
+        lua_settop(L, lua_gettop(L) - 3);
+        return NULL;
+    }
+    lua_settop(L, lua_gettop(L) - 3);
+    return (PangoLayout *)w->p;
 }
 
 static int
@@ -611,7 +651,18 @@ static const luaL_Reg FONTMAP_M[] = {
 
 static int cx_new(lua_State *L)
 {
-    return push_obj(L, pango_context_new(), d_unref, C_CONTEXT);
+    /* pango_context_new() returns a context with no font map and no font
+     * backend on this Pango 1.48 build. Any fontset load then goes through
+     * pango_context_load_fontset() -> the deprecated stub
+     * pango_font_map_load_fontset(NULL, ...), which only warns
+     * "assertion 'fontmap != NULL' failed" and returns NULL, so a layout pass
+     * retries it forever: a hot loop that also spews g_object_get_qdata
+     * criticals and never returns. Tie the context to the default font map
+     * instead -- what pango_cairo_create_layout() does -- and the same call
+     * gives ink=37x12 for "Hello" with zero criticals. */
+    return push_obj(L, pango_font_map_create_context(
+                   (PangoFontMap *)pango_cairo_font_map_get_default()),
+                    d_unref, C_CONTEXT);
 }
 
 static int cx_set_resolution(lua_State *L)
