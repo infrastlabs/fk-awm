@@ -128,14 +128,20 @@ option(AWESOME_LGISHIM "Build the static LGI shim (lib/vendor/lgishim_pango.c)" 
 if(AWESOME_LGISHIM)
     include(FindPkgConfig)
     pkg_check_modules(LGISHIM_PANGO_REQUIRED pango pangocairo)
+    pkg_check_modules(LGISHIM_PIXBUF_REQUIRED gdk-pixbuf-2.0)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pango.c)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_cairo.c)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_glib.c)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pixbuf.c)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gobject.c)
     # include_directories() was already called above (before this option block
     # ran), so appending to AWESOME_REQUIRED_INCLUDE_DIRS here would be a no-op.
     # Re-invoking include_directories() is cumulative for every target added
     # later in this file, which is what we need.
     include_directories(${LGISHIM_PANGO_INCLUDE_DIRS})
+    include_directories(${LGISHIM_PIXBUF_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PANGO_INCLUDE_DIRS})
+    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PIXBUF_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_LDFLAGS
         -Wl,--start-group
         -l:libpangocairo-1.0.a -l:libpangoft2-1.0.a -l:libpangoxft-1.0.a
@@ -143,6 +149,7 @@ if(AWESOME_LGISHIM)
         -lfreetype -l:libpng16.a -lbrotlidec -lbrotlicommon
         -lharfbuzz -lgraphite2 -lfontconfig -lfribidi -l:libpixman-1.a -luuid
         -lgmodule-2.0 -lgio-2.0 -lgobject-2.0 -lglib-2.0
+        -l:libgdk_pixbuf-2.0.a
         -lexpat -lbz2 -lz -lpcre -lnettle -lffi -lintl
         -Wl,--end-group)
 endif()
