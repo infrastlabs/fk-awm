@@ -136,15 +136,16 @@ if(AWESOME_LGISHIM)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pixbuf.c)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gobject.c)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gio.c)
-    # include_directories() was already called above (before this option block
-    # ran), so appending to AWESOME_REQUIRED_INCLUDE_DIRS here would be a no-op.
-    # Re-invoking include_directories() is cumulative for every target added
-    # later in this file, which is what we need.
-    include_directories(${LGISHIM_PANGO_INCLUDE_DIRS})
-    include_directories(${LGISHIM_PIXBUF_INCLUDE_DIRS})
+    # pkg_check_modules 的 prefix 是 LGISHIM_PANGO_REQUIRED / LGISHIM_PIXBUF_REQUIRED，
+    # 所以变量名必须带 _REQUIRED。用错成 LGISHIM_PANGO_INCLUDE_DIRS 在干净 build dir
+    # 里是空的，pango/pangocairo.h 直接找不到；只有带着历史 CMakeCache 的旧 build dir
+    # （commit ababafb9 时 prefix 还是 LGISHIM_PANGO）才会因为残留缓存"看起来能编"。
+    # GIOUNIX 的 prefix 本身就是 LGISHIM_GIOUNIX，所以不带 _REQUIRED。
+    include_directories(${LGISHIM_PANGO_REQUIRED_INCLUDE_DIRS})
+    include_directories(${LGISHIM_PIXBUF_REQUIRED_INCLUDE_DIRS})
     include_directories(${LGISHIM_GIOUNIX_INCLUDE_DIRS})
-    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PANGO_INCLUDE_DIRS})
-    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PIXBUF_INCLUDE_DIRS})
+    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PANGO_REQUIRED_INCLUDE_DIRS})
+    list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PIXBUF_REQUIRED_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_GIOUNIX_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_LDFLAGS
         -Wl,--start-group
