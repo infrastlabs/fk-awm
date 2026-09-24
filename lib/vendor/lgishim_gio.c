@@ -13,7 +13,7 @@
  * `__gc` calls destroy(), `finish` releases early, `_native` returns the raw
  * pointer.
  *
- * Public API (docs/sam/spike4-glib-gio-scope-v2.md, Gio section):
+ * Public API (docs/sam/spike4-phase2-05-glib-gio-scope.md, Gio section):
  *   File:             new_for_path, new_for_uri, get_parent, get_child,
  *                     get_path, get_uri, get_basename, get_display_name,
  *                     query_info, query_file_type, query_exists,

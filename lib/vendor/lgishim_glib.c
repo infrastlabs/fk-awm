@@ -11,7 +11,7 @@
  * userdata holding { ptr, destroy, cls }; `__gc` calls destroy();
  * `_native` returns lightuserdata.
  *
- * Scope from docs/sam/spike4-glib-gio-scope-v2.md:
+ * Scope from docs/sam/spike4-phase2-05-glib-gio-scope.md:
  *   P0  main loop (timeout_add / source_remove + closure guard)
  *   P0  GLib.Variant (formats (u)/(us)/(uu)/(s)/(ssss)/(as)/() etc.)
  *   P1  path utils + GLib.KeyFile (+KeyFileFlags.NONE)
@@ -885,7 +885,7 @@ static const luaL_Reg DATETIME_M[] = {
  * `a{sv}` and `(i)` as variant types; we support them in the format
  * parser for future-proofing.
  *
- * Construction semantics (per spike4-glib-gio-scope-v2.md §Variant):
+ * Construction semantics (per spike4-phase2-05-glib-gio-scope.md §Variant):
  *   format "()"       -> empty tuple
  *   format "(<list>)" -> tuple with <list> type children, one Lua arg per child
  *   format "as"       -> array of strings, one Lua arg = table of strings

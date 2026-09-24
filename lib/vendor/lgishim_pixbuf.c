@@ -30,7 +30,7 @@
  * `GdkPixbuf` and `gdkpixbuf` (mirroring lgishim.lua's `M.cairo =
  * M.Cairo` pattern), and the inner table carries `Pixbuf` / `pixbuf`.
  *
- * Compile flags (see CMakeLists.txt:116-124, spike4-c-api-conventions.md):
+ * Compile flags (see CMakeLists.txt:116-124, spike4-phase2-04-c-api-conventions.md):
  *   -Wundef, -Wmissing-prototypes, -Wstrict-prototypes, -Wall, -Wextra,
  *   -Wno-unused-parameter, -Wuninitialized, -Wsign-compare, -Wformat-nonliteral.
  */
