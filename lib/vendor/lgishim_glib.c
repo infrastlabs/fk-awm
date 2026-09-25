@@ -700,11 +700,28 @@ static const luaL_Reg STRING_M[] = {
  * P2: GLib.Timer
  *
  * wibox/container/scroll.lua:425: ret._private.timer = GLib.Timer()
- * wibox/container/scroll.lua:131:  timer:elapsed()
+ * wibox/container/scroll.lua:131: timer:elapsed()
+ * wibox/container/scroll.lua:232,257: timer:stop()       (scroll:pause)
+ * wibox/container/scroll.lua:244:     timer:continue()   (scroll:continue)
+ * wibox/container/scroll.lua:255:     timer:start()      (scroll:reset_scrolling)
  *
  * GLib.Timer here is a GTimer (a wall-clock timer, NOT a main-loop timer
  * source). Its constructor takes no arguments; :elapsed() returns
  * seconds as a double.
+ *
+ * :stop() / :continue() / :start() are the pause/resume/reset trio the
+ * scroll container uses. scroll.lua:232,244,255,257 all call them in
+ * statement position, so no return value is ever consumed -- but the
+ * signatures still mirror real LGI rather than being flattened, so the
+ * binding stays drop-in if a future caller wants the result.
+ *
+ * Return value is glib-version dependent: g_timer_stop() /
+ * g_timer_continue() return void up to glib-2.79, then gboolean from
+ * 2.80 on (the 2.80 change exists precisely so the caller can tell
+ * whether the timer was running). We follow whichever ABI the build
+ * links against, which is what real LGI exposes for that toolchain.
+ * g_timer_start() is void in every version and resets the counter to
+ * zero as well as arming it.
  */
 
 static int
@@ -726,9 +743,46 @@ timer_elapsed(lua_State *L)
     return 1;
 }
 
+static int
+timer_stop(lua_State *L)
+{
+    GTimer *t = (GTimer *)chk(L, 1);
+#if GLIB_CHECK_VERSION(2, 80, 0)
+    lua_pushboolean(L, g_timer_stop(t));
+    return 1;
+#else
+    g_timer_stop(t);
+    return 0;
+#endif
+}
+
+static int
+timer_continue(lua_State *L)
+{
+    GTimer *t = (GTimer *)chk(L, 1);
+#if GLIB_CHECK_VERSION(2, 80, 0)
+    lua_pushboolean(L, g_timer_continue(t));
+    return 1;
+#else
+    g_timer_continue(t);
+    return 0;
+#endif
+}
+
+static int
+timer_start(lua_State *L)
+{
+    GTimer *t = (GTimer *)chk(L, 1);
+    g_timer_start(t);
+    return 0;
+}
+
 static const luaL_Reg TIMER_M[] = {
-    { "new",     timer_new },
-    { "elapsed", timer_elapsed },
+    { "new",      timer_new },
+    { "elapsed",  timer_elapsed },
+    { "stop",     timer_stop },
+    { "continue", timer_continue },
+    { "start",    timer_start },
     { NULL, NULL },
 };
 

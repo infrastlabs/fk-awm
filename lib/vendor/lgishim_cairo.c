@@ -1081,6 +1081,22 @@ static int surface_finish(lua_State *L) { cairo_surface_finish(chk_surface(L, 1)
 static int surface_show_page(lua_State *L)
 { cairo_surface_show_page(chk_surface(L, 1)); return 0; }
 
+/* lib/awful/screenshot.lua:841 -- the save() path every screenshot keybinding
+ * hits. cairo_surface_write_to_png accepts any surface type, so it is routed
+ * through chk_surface() rather than an image-only guard, and the returned
+ * cairo_status_t decides the outcome (screenshot.lua ignores the return value,
+ * so an error is raised instead of being swallowed into a failed save). */
+static int surface_write_to_png(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 2);
+    cairo_status_t st = cairo_surface_write_to_png(chk_surface(L, 1), path);
+
+    if (st != CAIRO_STATUS_SUCCESS)
+        return luaL_error(L, "lgishim: write_to_png(%s) failed: %s", path,
+                          enum_to_name(STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st));
+    return 0;
+}
+
 static const luaL_Reg SURF_PG[] = {
     { "width",   surface_get_width },
     { "height",  surface_get_height },
@@ -1105,6 +1121,7 @@ static const luaL_Reg SURF_M[] = {
     { "mark_dirty", surface_mark_dirty },
     { "mark_dirty_rectangle", surface_mark_dirty_rectangle },
     { "show_page", surface_show_page },
+    { "write_to_png", surface_write_to_png },
     { NULL, NULL },
 };
 
