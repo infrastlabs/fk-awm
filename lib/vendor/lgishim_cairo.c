@@ -1460,6 +1460,21 @@ static int ctx_reset_matrix(lua_State *L)
     return 0;
 }
 
+/* lib/wibox/widget/systray.lua:75 probes (1,0) to detect a rotated context.
+ * This container's cairo is pre-1.8: cairo_user_to_device_distance(cr, &dx, &dy)
+ * rewrites the vector in place instead of the modern
+ * (cr, dx0, dy0, &ox0, &oy0, &tx, &ty) form, so the translated length is simply
+ * the transformed (dx, dy) -- the translation part never enters it. */
+static int ctx_user_to_device_distance(lua_State *L)
+{
+    double dx = luaL_checknumber(L, 2), dy = luaL_checknumber(L, 3);
+
+    cairo_user_to_device_distance(chk(L, 1), &dx, &dy);
+    lua_pushnumber(L, dx);
+    lua_pushnumber(L, dy);
+    return 2;
+}
+
 static int ctx_set_operator(lua_State *L)
 {
     cairo_set_operator(chk(L, 1),
@@ -1682,6 +1697,11 @@ static int ctx_pop_group_to_source(lua_State *L)
 { cairo_pop_group_to_source(chk(L, 1)); return 0; }
 
 static int ctx_new_path(lua_State *L) { cairo_new_path(chk(L, 1)); return 0; }
+
+/* lib/gears/shape.lua (rounded_rect:287, pie:622, arc:661) opens a fresh
+ * sub-path so the trailing close_path() returns to its own starting point
+ * instead of the enclosing path's. */
+static int ctx_new_sub_path(lua_State *L) { cairo_new_sub_path(chk(L, 1)); return 0; }
 
 static int ctx_get_status(lua_State *L)
 {
@@ -2023,6 +2043,7 @@ static const luaL_Reg CTX_M[] = {
     { "set_matrix", ctx_set_matrix },
     { "get_matrix", ctx_get_matrix },
     { "reset_matrix", ctx_reset_matrix },
+    { "user_to_device_distance", ctx_user_to_device_distance },
     { "set_operator", ctx_set_operator },
     { "get_operator", ctx_get_operator },
     { "set_source", ctx_set_source },
@@ -2047,6 +2068,7 @@ static const luaL_Reg CTX_M[] = {
     { "reset_clip", ctx_reset_clip },
     { "clip_extents", ctx_clip_extents },
     { "new_path", ctx_new_path },
+    { "new_sub_path", ctx_new_sub_path },
     { "push_group", ctx_push_group },
     { "push_group_with_content", ctx_push_group_with_content },
     { "push_group_to_image", ctx_push_group_to_image },
