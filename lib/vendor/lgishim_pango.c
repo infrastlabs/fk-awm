@@ -216,10 +216,14 @@ enum_from(lua_State *L, int idx, const struct enumpair *t, size_t n, int defv)
 {
     const char *s = luaL_optstring(L, idx, NULL);
     size_t i;
-    if (s)
+    if (s) {
         for (i = 0; i < n; i++)
             if (!strcmp(s, t[i].name))
                 return t[i].value;
+        /* A missing argument is the documented "use default" path; a supplied
+         * name that matches nothing is a typo and must not fall back to defv. */
+        return luaL_error(L, "lgishim.Pango: unknown %s value", s);
+    }
     return defv;
 }
 

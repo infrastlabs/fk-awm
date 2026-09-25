@@ -1,9 +1,14 @@
 /*
  * lgishim_pixbuf.c - GdkPixbuf Lua binding for the LGI shim.
  *
- * Replaces `lgi.GdkPixbuf` for the small set of APIs actually used by
- * lib/: only `GdkPixbuf.Pixbuf.new_from_file(path)` is called
- * (lib/gears/surface.lua:59).  lib/ reads `pixbuf._native` and hands the
+ * Replaces `lgi.GdkPixbuf` for the small set of APIs actually used:
+ * lib/ calls only `GdkPixbuf.Pixbuf.new_from_file(path)`
+ * (lib/gears/surface.lua:59), and the module-level
+ * `GdkPixbuf.pixbuf_get_from_surface(surface, x, y, w, h)` is called from
+ * spec/gears/surface_spec.lua:50,57.  The latter takes a cairo surface, so
+ * this module reaches into lgishim_cairo.c for the raw cairo_surface_t *.
+ *
+ * lib/ reads `pixbuf._native` and hands the
  * lightuserdatum straight to capi.awesome.pixbuf_to_surface (luaa.c:322),
  * which does `(GdkPixbuf *)lua_touserdata(L, 1)` and calls
  * draw_surface_from_pixbuf() (draw.c:85).
@@ -39,12 +44,19 @@
 #include <lua.h>
 
 #include <stddef.h>
+#include <string.h>
 
+#include <cairo.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib-object.h>
 
 /* Exported to luaa.c, which registers it in package.preload. */
 int luaopen_lgishim_pixbuf(lua_State *L);
+
+/* Provided by lgishim_cairo.c, which owns the wrap layout of a
+ * cairo.Surface.  Declared here, mirroring the lgishim_pango_check_layout()
+ * split (lgishim_cairo.c:90-94 declares the one pango provides). */
+cairo_surface_t *lgishim_cairo_check_surface(lua_State *L, int idx);
 
 enum {
     C_PIXBUF = 1,
@@ -330,6 +342,145 @@ pixbuf_new_from_file(lua_State *L)
     return push_obj(L, pixbuf, d_pixbuf, C_PIXBUF);
 }
 
+#if !defined(CAIRO_HAS_GDKPIXBUF_FUNCTIONS)
+/* Render the rect into our own ARGB32 image surface and copy its bytes into a
+ * fresh pixbuf.  gdk-pixbuf's cairo glue (gdk_pixbuf_get_from_surface,
+ * declared by <cairo.h> only under CAIRO_HAS_GDKPIXBUF_FUNCTIONS) is absent
+ * from this toolchain: cairo-features.h defines no
+ * CAIRO_HAS_GDKPIXBUF_FUNCTIONS and libcairo.a exports no gdk_pixbuf_* symbol
+ * at all, so the direct call would compile but fail to link.  draw.c:85 hit
+ * the same gap going the other way and hand-rolled the copy; this is the
+ * mirror image.  Returns NULL on failure, so the caller raises. */
+static GdkPixbuf *
+surface_to_pixbuf(cairo_surface_t *surface, int sx, int sy, int w, int h)
+{
+    cairo_surface_t *tmp;
+    cairo_t *cr;
+    cairo_status_t status;
+    const unsigned char *data;
+    unsigned char *rowsrc;
+    unsigned char *dest;
+    size_t stride;
+    size_t dststride;
+    int row;
+    GdkPixbuf *pixbuf;
+
+    status = cairo_surface_status(surface);
+    if (status != CAIRO_STATUS_SUCCESS)
+        return NULL;
+
+    /* create_similar() is cheaper for a backend surface, but it can hand back a
+     * surface with no in-process pixel buffer (Xlib, script, png, ...), and
+     * cairo_image_surface_get_data() asserts on those.  Fall back to a plain
+     * image surface whenever the result is not an image surface -- the same
+     * guard lgishim_cairo.c's surface_get_data() applies.  Note create_similar
+     * takes a cairo_content_t (0x1000+), NOT the cairo_format_t used by
+     * cairo_image_surface_create below; ARGB32 == COLOR_ALPHA in value but the
+     * two enums are unrelated, and content 0 means "invalid content". */
+    tmp = cairo_surface_create_similar(surface, CAIRO_CONTENT_COLOR_ALPHA, w, h);
+    status = cairo_surface_status(tmp);
+    if (status != CAIRO_STATUS_SUCCESS ||
+        cairo_surface_get_type(tmp) != CAIRO_SURFACE_TYPE_IMAGE) {
+        cairo_surface_destroy(tmp);
+        tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+        status = cairo_surface_status(tmp);
+    }
+    if (status != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(tmp);
+        return NULL;
+    }
+
+    /* Painting the source at (-sx, -sy) shifts the window, so only the rect is
+     * sampled; cairo clips reads outside the source, so a negative offset
+     * cannot overread.  Check the paint result: a failed context would leave
+     * `tmp` zero-filled and we would hand back an all-transparent pixbuf
+     * instead of raising. */
+    cairo_surface_flush(surface);
+    cr = cairo_create(tmp);
+    cairo_set_source_surface(cr, surface, -sx, -sy);
+    cairo_paint(cr);
+    status = cairo_status(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(tmp);
+    if (status != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(tmp);
+        return NULL;
+    }
+
+    data = cairo_image_surface_get_data(tmp);
+    if (!data) {
+        cairo_surface_destroy(tmp);
+        return NULL;
+    }
+
+    /* RGBA, 4 channels, has_alpha -- the shape
+     * gdk_pixbuf_get_from_surface() promises.  Note the 3rd argument is
+     * bits_per_sample, NOT depth: depth is derived as bits_per_sample *
+     * n_channels, so 8 with has_alpha gives depth 32 / n_channels 4 /
+     * bits_per_sample 8.  Passing 24 (the depth) makes gdk-pixbuf compute
+     * bits_per_sample 6 and trips gdk_pixbuf_calculate_rowstride()'s
+     * 'bits_per_sample == 8' assertion, so the allocation returns an unusable
+     * pixbuf.  The bytes are copied verbatim, so cairo's ARGB32 premultiplied
+     * alpha stays premultiplied, exactly as upstream's glue does; no
+     * un-premultiplication is applied here.  The pixbuf owns its own copy of
+     * the bytes, so the wrap's d_pixbuf releases it exactly once and no
+     * borrowed pointer escapes. */
+    pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, w, h);
+    if (!pixbuf) {
+        cairo_surface_destroy(tmp);
+        return NULL;
+    }
+
+    stride = (size_t)cairo_image_surface_get_stride(tmp);
+    rowsrc = (unsigned char *)data;
+    dest = gdk_pixbuf_get_pixels(pixbuf);
+    dststride = (size_t)gdk_pixbuf_get_rowstride(pixbuf);
+    for (row = 0; row < h; row++)
+        memcpy(dest + (size_t)row * dststride,
+               rowsrc + (size_t)row * stride, (size_t)w * 4);
+    cairo_surface_destroy(tmp);
+
+    return pixbuf;
+}
+#endif
+
+static int
+pixbuf_get_from_surface(lua_State *L)
+{
+    cairo_surface_t *surface;
+    int sx, sy, w, h;
+    GdkPixbuf *pixbuf;
+
+    /* Module-level function, NOT a Pixbuf: method: the first argument is the
+     * cairo surface, not self (spec/gears/surface_spec.lua:50,57 -- the only
+     * callers in tree, and both pass a wrapped cairo.Surface).  check_surface
+     * also validates w->cls, so a wrapped GdkPixbuf handed in here raises
+     * instead of being reinterpreted as a surface. */
+    surface = lgishim_cairo_check_surface(L, 1);
+    sx = (int)luaL_checknumber(L, 2);
+    sy = (int)luaL_checknumber(L, 3);
+    w = (int)luaL_checknumber(L, 4);
+    h = (int)luaL_checknumber(L, 5);
+
+    if (w <= 0 || h <= 0)
+        return luaL_error(L, "lgishim_pixbuf: pixbuf_get_from_surface: "
+                              "width and height must be positive, got %dx%d",
+                          w, h);
+
+#if defined(CAIRO_HAS_GDKPIXBUF_FUNCTIONS)
+    pixbuf = gdk_pixbuf_get_from_surface(surface, sx, sy, w, h);
+    if (!pixbuf)
+        return luaL_error(L, "lgishim_pixbuf: pixbuf_get_from_surface: "
+                              "cairo refused the rectangle");
+#else
+    pixbuf = surface_to_pixbuf(surface, sx, sy, w, h);
+    if (!pixbuf)
+        return luaL_error(L, "lgishim_pixbuf: pixbuf_get_from_surface: "
+                              "failed to read the surface");
+#endif
+    return push_obj(L, pixbuf, d_pixbuf, C_PIXBUF);
+}
+
 static int
 pixbuf_finish(lua_State *L)
 {
@@ -376,12 +527,20 @@ luaopen_lgishim_pixbuf(lua_State *L)
     class_setup(L, C_PIXBUF, PIXBUF_M, PIXBUF_PG, NULL);
     lua_setfield(L, -2, "Pixbuf");             /* lgi.GdkPixbuf.Pixbuf */
 
-    /* The module-level aliases (GdkPixbuf/gdkpixbuf and the lowercase
+    /* pixbuf_get_from_surface is a MODULE-LEVEL function, not a Pixbuf:
+     * method (the cairo surface is arg 1, not self), so it goes on the module
+     * table and NOT in PIXBUF_M.  Pushing it after lua_setfield() above is
+     * fine: that call already popped the class table, so the module table is
+     * on top again and the cfunction binds to it. */
+    lua_pushcfunction(L, pixbuf_get_from_surface);
+    lua_setfield(L, -2, "pixbuf_get_from_surface");
+
+    /* The module-level aliases (GdkPixbuf/gdkpixbuf/Gdk and the lowercase
      * `pixbuf` class alias) are not installed here: lua_setfield() pops the
      * class table, so anything pushed afterwards points at the module table
      * itself, and a lua_pushvalue() copy is a distinct table. lgishim.lua owns
-     * all of them (M.GdkPixbuf / M.gdkpixbuf / M.GdkPixbuf.pixbuf), where a
-     * plain assignment is a genuine identity copy, which is where lib/ actually
-     * reaches for them. */
+     * all of them (M.GdkPixbuf / M.gdkpixbuf / M.Gdk / M.GdkPixbuf.pixbuf),
+     * where a plain assignment is a genuine identity copy, which is where lib/
+     * actually reaches for them. */
     return 1;
 }

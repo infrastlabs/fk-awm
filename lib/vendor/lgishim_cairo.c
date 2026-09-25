@@ -87,6 +87,13 @@
 /* Exported to luaa.c, which registers it in package.preload. */
 int luaopen_lgishim_cairo(lua_State *L);
 
+/* Exported to lgishim_pixbuf.c for the module-level
+ * GdkPixbuf.pixbuf_get_from_surface(): that module has no view of this file's
+ * wrap layout, so it cannot recover the raw cairo_surface_t * behind a wrapped
+ * cairo.Surface.  Mirrors lgishim_pango_check_layout() (lgishim_pango.c:46-47),
+ * which runs the other way (pango defines, cairo consumes). */
+cairo_surface_t *lgishim_cairo_check_surface(lua_State *L, int idx);
+
 /* Provided by lgishim_pango.c; PangoLayout is opaque over there. The
  * pangocairo entry points themselves are named pango_cairo_* in this build
  * (with the second underscore), not pangocairo_* as the lgi typelib spells
@@ -667,10 +674,28 @@ class_setup(lua_State *L, int cls, const luaL_Reg *m,
 
 static void d_matrix(void *p) { free(p); }
 
+/* Exported to lgishim_pixbuf.c (prototype above).  Unlike chk_surface() it
+ * also checks w->cls, because a caller from another module can hand in *any*
+ * full userdata and a wrapped GdkPixbuf or cairo.Context would otherwise be
+ * reinterpreted as a surface and dereferenced. */
+cairo_surface_t *
+lgishim_cairo_check_surface(lua_State *L, int idx)
+{
+    wrap *w = getud(L, idx);
+
+    if (!w)
+        luaL_error(L, "lgishim: expected cairo.Surface at arg %d, got %s",
+                   idx, lua_isnil(L, idx) ? "nil" : luaL_typename(L, idx));
+    if (w->cls != C_SURFACE)
+        luaL_error(L, "lgishim: expected cairo.Surface at arg %d, got class %d",
+                   idx, w->cls);
+    return (cairo_surface_t *)w->p;
+}
+
 static cairo_surface_t *
 chk_surface(lua_State *L, int idx)
 {
-    return (cairo_surface_t *)chk(L, idx);
+    return lgishim_cairo_check_surface(L, idx);
 }
 
 static cairo_pattern_t *
