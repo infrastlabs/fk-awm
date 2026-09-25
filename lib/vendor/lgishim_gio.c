@@ -452,6 +452,12 @@ static const struct enumpair FILE_QUERY_INFO_FLAGS[] = {
     { "NOFOLLOW_SYMLINKS", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS },
 };
 
+static const struct enumpair FILE_CREATE_FLAGS[] = {
+    { "NONE",                 G_FILE_CREATE_NONE },
+    { "PRIVATE",              G_FILE_CREATE_PRIVATE },
+    { "REPLACE_DESTINATION",  G_FILE_CREATE_REPLACE_DESTINATION },
+};
+
 /*
  * Flags come in two shapes: the integer this module installs, or the empty
  * table that gears/filesystem.lua:96 passes for FileQueryInfoFlags.NONE.
@@ -799,6 +805,36 @@ file_new_for_uri(lua_State *L)
 }
 
 static int
+file_new_tmp(lua_State *L)
+{
+    const char *tmpl = NULL;
+    GFileIOStream *iostream = NULL;
+    GError *err = NULL;
+    GFile *f;
+
+    if (!lua_isnoneornil(L, 1))
+        tmpl = luaL_checkstring(L, 1);
+
+    f = g_file_new_tmp(tmpl, &iostream, &err);
+
+    if (err) {
+        if (f)
+            g_object_unref(f);
+        if (iostream)
+            g_object_unref(iostream);
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+
+    /* iostream is rarely needed from Lua; drop it. */
+    if (iostream)
+        g_object_unref(iostream);
+    return push_obj(L, f, d_object, C_FILE);
+}
+
+static int
 file_get_path(lua_State *L)
 {
     const char *p = g_file_get_path(chk_cls(L, 1, C_FILE));
@@ -988,6 +1024,54 @@ file_delete(lua_State *L)
 }
 
 static int
+file_make_symbolic_link(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    size_t len;
+    const char *target = luaL_checklstring(L, 2, &len);
+    GError *err = NULL;
+    gboolean ok;
+
+    if (!f || !target) {
+        lua_pushboolean(L, FALSE);
+        lua_pushnil(L);
+        return 2;
+    }
+
+    ok = g_file_make_symbolic_link(f, target, NULL, &err);
+
+    lua_pushboolean(L, ok);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
+file_create(lua_State *L)
+{
+    GFile *f = chk_cls(L, 1, C_FILE);
+    gint32 flags = (gint32)luaL_checkinteger(L, 2);
+    GError *err = NULL;
+    GFileIOStream *stream;
+
+    if (!f) {
+        lua_pushnil(L);
+        lua_pushnil(L);
+        return 2;
+    }
+
+    stream = g_file_create(f, (GFileCreateFlags)flags, NULL, &err);
+
+    if (stream)
+        g_object_unref(stream);
+
+    lua_pushboolean(L, stream != NULL);
+    push_error(L, err);
+    g_clear_error(&err);
+    return 2;
+}
+
+static int
 file_enumerate_children(lua_State *L)
 {
     GFile *f = chk_cls(L, 1, C_FILE);
@@ -1107,6 +1191,7 @@ fileenum_close(lua_State *L)
 static const luaL_Reg FILE_M[] = {
     { "new_for_path",                file_new_for_path },
     { "new_for_uri",                 file_new_for_uri },
+    { "new_tmp",                     file_new_tmp },
     { "get_parent",                  file_get_parent },
     { "get_child",                   file_get_child },
     { "get_path",                    file_get_path },
@@ -1119,6 +1204,8 @@ static const luaL_Reg FILE_M[] = {
     { "make_directory",              file_make_directory },
     { "make_directory_with_parents", file_make_directory_with_parents },
     { "delete",                      file_delete },
+    { "make_symbolic_link",          file_make_symbolic_link },
+    { "create",                      file_create },
     { "enumerate_children",          file_enumerate_children },
     { "async_enumerate_children",    file_enumerate_children },
     { NULL, NULL },
@@ -2393,6 +2480,8 @@ luaopen_lgishim_gio(lua_State *L)
                  G_N_ELEMENTS(DBUS_CALL_FLAGS));
     install_enum(L, "FileQueryInfoFlags", FILE_QUERY_INFO_FLAGS,
                  G_N_ELEMENTS(FILE_QUERY_INFO_FLAGS));
+    install_enum(L, "FileCreateFlags", FILE_CREATE_FLAGS,
+                 G_N_ELEMENTS(FILE_CREATE_FLAGS));
     install_enum(L, "FileType", FILE_TYPES,
                  G_N_ELEMENTS(FILE_TYPES));
     install_enum(L, "FileAttributeType", FILE_ATTRIBUTE_TYPES,

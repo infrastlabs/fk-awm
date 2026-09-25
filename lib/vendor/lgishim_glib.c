@@ -619,6 +619,49 @@ glib_get_system_data_dirs(lua_State *L)
 }
 
 /* ================================================================
+ * P1.5: Environment
+ *   GLib.getenv(name) -> string or nil
+ *   GLib.setenv(name, value, overwrite)
+ *   GLib.find_program_in_path(filename) -> string or nil
+ */
+
+static int
+glib_getenv(lua_State *L)
+{
+    const gchar *name = luaL_checkstring(L, 1);
+    const gchar *s = g_getenv(name);
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+static int
+glib_setenv(lua_State *L)
+{
+    const gchar *name = luaL_checkstring(L, 1);
+    const gchar *value = luaL_checkstring(L, 2);
+    gboolean overwrite = lua_toboolean(L, 3);
+    g_setenv(name, value, overwrite);
+    return 0;
+}
+
+static int
+glib_find_program_in_path(lua_State *L)
+{
+    const gchar *filename = luaL_checkstring(L, 1);
+    gchar *result = g_find_program_in_path(filename);
+    if (result) {
+        lua_pushstring(L, result);
+        g_free(result);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+/* ================================================================
  * P2: UTF-8 helpers
  *   GLib.utf8_strlen(s, len) -> int      (len may be -1 for null-terminated)
  *   GLib.utf8_substring(s, offset, nchars) -> string
@@ -1614,6 +1657,10 @@ luaopen_lgishim_glib(lua_State *L)
         { "get_home_dir",        glib_get_home_dir },
         { "get_user_data_dir",   glib_get_user_data_dir },
         { "get_system_data_dirs", glib_get_system_data_dirs },
+        /* P1.5 env */
+        { "getenv",               glib_getenv },
+        { "setenv",               glib_setenv },
+        { "find_program_in_path", glib_find_program_in_path },
         /* P2 UTF-8 */
         { "utf8_strlen",     glib_utf8_strlen },
         { "utf8_substring",  glib_utf8_substring },

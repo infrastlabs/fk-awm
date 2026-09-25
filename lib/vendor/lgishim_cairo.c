@@ -1260,6 +1260,21 @@ static int pattern_create_radial(lua_State *L)
         d_pattern, C_PATTERN);
 }
 
+/* lgi exposes Pattern.create_translate(x, y) as a static constructor that
+ * wraps a solid-colour pattern with a translation matrix set. The pattern
+ * itself is opaque black (inherited from the parent gradient if any); the
+ * important part is the matrix that translates source coordinates. */
+static int pattern_create_translate(lua_State *L)
+{
+    cairo_pattern_t *p = cairo_pattern_create_rgba(0, 0, 0, 1);
+    cairo_matrix_t m;
+
+    cairo_matrix_init_translate(&m,
+            luaL_checknumber(L, 1), luaL_checknumber(L, 2));
+    cairo_pattern_set_matrix(p, &m);
+    return push_obj(L, p, d_pattern, C_PATTERN);
+}
+
 static int pattern_get_type(lua_State *L)
 {
     return enum_to(L, PATTERN_TYPE, sizeof(PATTERN_TYPE) / sizeof(PATTERN_TYPE[0]),
@@ -1373,6 +1388,55 @@ static int pattern_get_color_stop_count(lua_State *L)
     enum_to(L, STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st);
     lua_pushinteger(L, n);
     return 2;
+}
+
+/* ---- Pattern gradient geometry getters (status + coords) ---------------- */
+
+/* get_linear_points() -> status, x1, y1, x2, y2
+ * Only valid on CAIRO_PATTERN_TYPE_LINEAR; otherwise returns
+ * CAIRO_STATUS_PATTERN_TYPE_MISMATCH as the leading status. */
+static int pattern_get_linear_points(lua_State *L)
+{
+    double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    cairo_pattern_t *p = chk_pattern(L, 1);
+    cairo_status_t st = cairo_pattern_get_linear_points(p, &x1, &y1, &x2, &y2);
+
+    enum_to(L, STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st);
+    lua_pushnumber(L, x1); lua_pushnumber(L, y1);
+    lua_pushnumber(L, x2); lua_pushnumber(L, y2);
+    return 5;
+}
+
+/* get_radial_circles() -> status, x1, y1, r1, x2, y2, r2
+ * Only valid on CAIRO_PATTERN_TYPE_RADIAL. */
+static int pattern_get_radial_circles(lua_State *L)
+{
+    double x1 = 0, y1 = 0, r1 = 0, x2 = 0, y2 = 0, r2 = 0;
+    cairo_pattern_t *p = chk_pattern(L, 1);
+    cairo_status_t st = cairo_pattern_get_radial_circles(p,
+            &x1, &y1, &r1, &x2, &y2, &r2);
+
+    enum_to(L, STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st);
+    lua_pushnumber(L, x1); lua_pushnumber(L, y1); lua_pushnumber(L, r1);
+    lua_pushnumber(L, x2); lua_pushnumber(L, y2); lua_pushnumber(L, r2);
+    return 7;
+}
+
+/* get_center_point() -> status, x, y
+ * Returns the centre of the first circle for a radial gradient.
+ * cairo 1.16 does not expose cairo_pattern_get_center_point(), so we
+ * delegate to get_radial_circles() and extract just (x1, y1). */
+static int pattern_get_center_point(lua_State *L)
+{
+    double x1 = 0, y1 = 0, r1 = 0, x2 = 0, y2 = 0, r2 = 0;
+    cairo_pattern_t *p = chk_pattern(L, 1);
+    cairo_status_t st = cairo_pattern_get_radial_circles(p,
+            &x1, &y1, &r1, &x2, &y2, &r2);
+
+    enum_to(L, STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st);
+    lua_pushnumber(L, x1);
+    lua_pushnumber(L, y1);
+    return 3;
 }
 
 /* Push the pattern's target surface with no leading status. This cairo returns
@@ -1501,6 +1565,8 @@ static const luaL_Reg PAT_M[] = {
     { "create_linear", pattern_create_linear },
     { "CreateRadial", pattern_create_radial },
     { "create_radial", pattern_create_radial },
+    { "CreateTranslate", pattern_create_translate },
+    { "create_translate", pattern_create_translate },
     { "get_rgba", pattern_get_rgba },
     { "get_type", pattern_get_type },
     { "get_filter", pattern_get_filter },
@@ -1522,6 +1588,9 @@ static const luaL_Reg PAT_M[] = {
     { "get_color_stop_rgba", pattern_get_color_stop_rgba },
     { "get_color_stop", pattern_get_color_stop_rgba },
     { "get_color_stop_count", pattern_get_color_stop_count },
+    { "get_linear_points", pattern_get_linear_points },
+    { "get_radial_circles", pattern_get_radial_circles },
+    { "get_center_point", pattern_get_center_point },
     { NULL, NULL },
 };
 
