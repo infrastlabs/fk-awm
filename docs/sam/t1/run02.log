@@ -1,0 +1,26 @@
+
+
+headless@hdmi-desktop:/usr/local/static/awesome/bin$ ./awesome -r
+2026-09-25 19:44:26 W: awesome: a_dbus_connect:618: Could not connect to D-Bus system bus: Failed to connect to socket /usr/local/var/run/dbus/system_bus_socket: No such file or directory
+2026-09-25 19:44:26 W: awesome: `awful.layout.layouts` was set before `request::default_layouts` could be called. Please use `awful.layout.append_default_layouts` to  avoid this problem
+2026-09-25 19:44:27 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 19:44:27 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 19:44:27 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 19:44:27 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 19:45:09 E: awesome: Failed to load '/usr/share/pixmaps/awesome.xpm': Couldn’t recognize the image file format for file “/usr/share/pixmaps/awesome.xpm”
+stack traceback:
+	...local/static/awesome/share/awesome/lib/gears/surface.lua:109: in function <...local/static/awesome/share/awesome/lib/gears/surface.lua:101>
+	(...tail calls...)
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:616: in function 'awful.menu.entry'
+	[C]: in function 'xpcall'
+	...tatic/awesome/share/awesome/lib/gears/protected_call.lua:41: in function <...tatic/awesome/share/awesome/lib/gears/protected_call.lua:40>
+	(...tail calls...)
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:440: in function 'awful.menu.add'
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:757: in function 'awful.menu.new'
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:281: in function 'awful.menu.exec'
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:343: in function 'awful.menu.item_enter'
+	/usr/local/static/awesome/share/awesome/lib/awful/menu.lua:469: in local 'func'
+	.../local/static/awesome/share/awesome/lib/gears/object.lua:139: in function 'gears.object.emit_signal'
+	...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:329: in upvalue 'emit_difference'
+	...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:352: in upvalue 'handle_motion'
+	...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:445: in function <...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:445>

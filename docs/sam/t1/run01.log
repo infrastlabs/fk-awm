@@ -1,0 +1,29 @@
+headless@hdmi-desktop:/usr/local/static/awesome/bin$ ./awesome
+2026-09-25 14:43:03 E: awesome: acquire_WM_Sn:311: another window manager is already running (selection owned; use --replace)
+headless@hdmi-desktop:/usr/local/static/awesome/bin$ ./awesome -r
+2026-09-25 14:43:07 W: awesome: a_dbus_connect:618: Could not connect to D-Bus system bus: Failed to connect to socket /usr/local/var/run/dbus/system_bus_socket: No such file or directory
+2026-09-25 14:43:07 W: awesome: `awful.layout.layouts` was set before `request::default_layouts` could be called. Please use `awful.layout.append_default_layouts` to  avoid this problem
+2026-09-25 14:43:08 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 14:43:08 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 14:43:08 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 14:43:08 W: awesome: xerror:1056: X error: request=GrabKey (major 33, minor 0), error=BadAccess (10)
+2026-09-25 14:43:08 E: awesome: Error during a protected call: .../local/static/awesome/share/awesome/lib/gears/matrix.lua:185: attempt to call a nil value (method 'transform_point')
+stack traceback:
+	.../local/static/awesome/share/awesome/lib/gears/matrix.lua:185: in function 'gears.matrix.transform_rectangle'
+	(...tail calls...)
+	...tatic/awesome/share/awesome/lib/wibox/widget/systray.lua:62: in function 'wibox.widget.systray.draw'
+	[C]: in function 'xpcall'
+	...tatic/awesome/share/awesome/lib/gears/protected_call.lua:41: in function <...tatic/awesome/share/awesome/lib/gears/protected_call.lua:40>
+	(...tail calls...)
+	...cal/static/awesome/share/awesome/lib/wibox/hierarchy.lua:343: in local 'call'
+	...cal/static/awesome/share/awesome/lib/wibox/hierarchy.lua:358: in function 'wibox.hierarchy.draw'
+	...cal/static/awesome/share/awesome/lib/wibox/hierarchy.lua:367: in function 'wibox.hierarchy.draw'
+	...cal/static/awesome/share/awesome/lib/wibox/hierarchy.lua:367: in function 'wibox.hierarchy.draw'
+	...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:161: in upvalue 'do_redraw'
+	...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:397: in function <...ocal/static/awesome/share/awesome/lib/wibox/drawable.lua:395>
+	[C]: in function 'xpcall'
+	...tatic/awesome/share/awesome/lib/gears/protected_call.lua:41: in function <...tatic/awesome/share/awesome/lib/gears/protected_call.lua:40>
+	(...tail calls...)
+	/usr/local/static/awesome/share/awesome/lib/gears/timer.lua:279: in function 'gears.timer.run_delayed_calls_now'
+
+    
