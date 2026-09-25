@@ -37,6 +37,12 @@ if ok and type(Pango) == "table" then
     }
     M.cairo = M.Cairo  -- lowercase alias for the codebase's lgi.cairo usage
     M.gdkpixbuf = M.GdkPixbuf
+    -- spec/gears/surface_spec.lua:5 reaches the pixbuf namespace as lgi.Gdk.
+    -- Upstream lgi does load a Gdk namespace, but it does not carry
+    -- pixbuf_get_from_surface (which is why that spec passes there as a
+    -- "nil field" error rather than a missing-namespace one), so this alias is
+    -- what makes the call resolvable under the shim at all.
+    M.Gdk = M.GdkPixbuf
     M.gio = M.Gio
     -- C-side copy of the class table would be a *distinct* table, so the
     -- lowercase class alias is bound here where the assignment is a real
