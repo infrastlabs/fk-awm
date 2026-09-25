@@ -805,8 +805,84 @@ static int matrix_scale(lua_State *L)
     return push_matrix(L, &m);
 }
 
-/* Matrix field getters, installed through the property table so lib/ can read
- * mat.xx / mat.yx / ... exactly like it does for gears.matrix. */
+/* Transform methods. Return value counts match gears/matrix.lua semantics:
+ * :transform_distance returns 2 numbers, :transform_point returns 2 numbers,
+ * :transform_rectangle returns 4 numbers (x, y, w, h of the bounding box).
+ *
+ * Called by lib/wibox/widget/base.lua:536 as `matrix.transform_rectangle(cr.matrix, ...)`,
+ * where cr.matrix is a C_MATRIX userdata (see ctx_get_matrix). Without these the
+ * entire `systray:draw` (systray.lua:62) and `drawable.lua:173` crash with
+ * `attempt to call a nil value (method 'transform_rectangle')` -- the exact
+ * bug a real desktop surfaces when the systray widget is inside a transformed
+ * cairo context. */
+static int matrix_transform_distance(lua_State *L)
+{
+    cairo_matrix_t m = *chk_matrix(L, 1);
+    double x = luaL_checknumber(L, 2);
+    double y = luaL_checknumber(L, 3);
+
+    lua_pushnumber(L, m.xx * x + m.xy * y);
+    lua_pushnumber(L, m.yx * x + m.yy * y);
+    return 2;
+}
+
+static int matrix_transform_point(lua_State *L)
+{
+    cairo_matrix_t m = *chk_matrix(L, 1);
+    double x = luaL_checknumber(L, 2);
+    double y = luaL_checknumber(L, 3);
+    double x1 = m.xx * x + m.xy * y + m.x0;
+    double y1 = m.yx * x + m.yy * y + m.y0;
+
+    lua_pushnumber(L, x1);
+    lua_pushnumber(L, y1);
+    return 2;
+}
+
+static int matrix_transform_rectangle(lua_State *L)
+{
+    cairo_matrix_t m = *chk_matrix(L, 1);
+    double x0 = luaL_checknumber(L, 2);
+    double y0 = luaL_checknumber(L, 3);
+    double w  = luaL_checknumber(L, 4);
+    double h  = luaL_checknumber(L, 5);
+    double tx, ty, x1, y1, x2, y2, x3, y3, x4, y4;
+    double minx, maxx, miny, maxy;
+
+    /* transform all four corners via the same math as transform_point */
+    tx = x0;                    ty = y0;
+    x1 = m.xx * tx + m.xy * ty + m.x0;
+    y1 = m.yx * tx + m.yy * ty + m.y0;
+    tx = x0;                    ty = y0 + h;
+    x2 = m.xx * tx + m.xy * ty + m.x0;
+    y2 = m.yx * tx + m.yy * ty + m.y0;
+    tx = x0 + w;                ty = y0 + h;
+    x3 = m.xx * tx + m.xy * ty + m.x0;
+    y3 = m.yx * tx + m.yy * ty + m.y0;
+    tx = x0 + w;                ty = y0;
+    x4 = m.xx * tx + m.xy * ty + m.x0;
+    y4 = m.yx * tx + m.yy * ty + m.y0;
+
+    minx = x1 < x2 ? (x1 < x3 ? (x1 < x4 ? x1 : x4) : (x1 < x4 ? x1 : x4))
+                   : (x1 < x3 ? (x2 < x4 ? x2 : x4) : (x2 < x4 ? x2 : x4));
+    maxx = x1 > x2 ? (x1 > x3 ? (x1 > x4 ? x1 : x4) : (x1 > x4 ? x1 : x4))
+                   : (x1 > x3 ? (x2 > x4 ? x2 : x4) : (x2 > x4 ? x2 : x4));
+    miny = y1 < y2 ? (y1 < y3 ? (y1 < y4 ? y1 : y4) : (y1 < y4 ? y1 : y4))
+                   : (y1 < y3 ? (y2 < y4 ? y2 : y4) : (y2 < y4 ? y2 : y4));
+    maxy = y1 > y2 ? (y1 > y3 ? (y1 > y4 ? y1 : y4) : (y1 > y4 ? y1 : y4))
+                   : (y1 > y3 ? (y2 > y4 ? y2 : y4) : (y2 > y4 ? y2 : y4));
+
+    lua_pushnumber(L, minx);
+    lua_pushnumber(L, miny);
+    lua_pushnumber(L, maxx - minx);
+    lua_pushnumber(L, maxy - miny);
+    return 4;
+}
+
+/* lgi exposes Matrix.create_translate(x, y) as a static constructor on the
+ * Matrix class. Same semantics as :translate (both are identity-then-translate
+ * into a fresh matrix); registered under both names so either spelling works.
+ * Called from lib/vendor/lgishim_pango.c for pango path transforms. */
 static int mat_get_xx(lua_State *L) { lua_pushnumber(L, chk_matrix(L, 1)->xx); return 1; }
 static int mat_get_yx(lua_State *L) { lua_pushnumber(L, chk_matrix(L, 1)->yx); return 1; }
 static int mat_get_xy(lua_State *L) { lua_pushnumber(L, chk_matrix(L, 1)->xy); return 1; }
@@ -825,9 +901,13 @@ static const luaL_Reg MATRIX_M[] = {
     { "init", matrix_init },
     { "identity", matrix_identity },
     { "translate", matrix_translate },
+    { "create_translate", matrix_translate },
     { "scale", matrix_scale },
     { "multiply", matrix_mul },
     { "invert", matrix_invert },
+    { "transform_distance", matrix_transform_distance },
+    { "transform_point", matrix_transform_point },
+    { "transform_rectangle", matrix_transform_rectangle },
     { NULL, NULL },
 };
 
@@ -1227,13 +1307,22 @@ static int pattern_get_matrix(lua_State *L)
 }
 static int pattern_get_rgba(lua_State *L)
 {
-    double r, g, b, a;
+    double r = 0, g = 0, b = 0, a = 0;
     cairo_pattern_t *p = chk_pattern(L, 1);
+    cairo_status_t st = cairo_pattern_get_rgba(p, &r, &g, &b, &a);
 
-    if (cairo_pattern_get_rgba(p, &r, &g, &b, &a) != CAIRO_STATUS_SUCCESS)
-        return luaL_error(L, "lgishim: pattern is not a solid color");
-    lua_pushnumber(L, r); lua_pushnumber(L, g); lua_pushnumber(L, b); lua_pushnumber(L, a);
-    return 4;
+    /* lgi puts the cairo status first, so these return it as return value 1
+     * and never raise. lib/gears/color.lua:305/368/401 all read five values
+     * `local error, r, g, b, a = pattern:get_rgba()` and branch on
+     * `error ~= "SUCCESS"`; raising would let the error slip into the
+     * `r` slot as a number, making all three callers silently no-op.
+     * Mirrors pattern_get_color_stop_rgba above. */
+    enum_to(L, STATUS, sizeof(STATUS) / sizeof(STATUS[0]), st);
+    lua_pushnumber(L, r);
+    lua_pushnumber(L, g);
+    lua_pushnumber(L, b);
+    lua_pushnumber(L, a);
+    return 5;
 }
 
 static int pattern_add_color_stop_rgba(lua_State *L)
