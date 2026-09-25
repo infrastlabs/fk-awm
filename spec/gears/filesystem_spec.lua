@@ -8,6 +8,41 @@ local gfs = require("gears.filesystem")
 describe("gears.filesystem", function()
     local root = (os.getenv("SOURCE_DIRECTORY") or '.') .. "/spec/gears/"
 
+    local no_read_file = root .. "filesystem_tests/x/NoRead"
+    local no_read_dir = root .. "filesystem_tests/y"
+
+    -- `chmod g-r,o-r,a-r` on 644 strips every read bit, i.e. leaves 600: the
+    -- owner still keeps rw-.  Root ignores the mode bits altogether.  In both
+    -- cases "the runner cannot read it" is false even when everything is
+    -- correct, so the assertion cannot be exercised here.  Return the reason,
+    -- or nil when the runner has no read path left and the assertion means
+    -- something.
+    local function untestable_without_others(path)
+        if os.execute('test "$(id -u)" -eq 0') then
+            return "root ignores mode bits, assertion untestable "
+                .. "without a non-root runner"
+        end
+
+        local owned = os.execute('test "$(id -u)" -eq "$(stat -c %u "'
+            .. path .. '")"')
+
+        if owned then
+            return "owner keeps rw after chmod a-r, assertion untestable "
+                .. "without a non-owner runner"
+        end
+
+        return nil
+    end
+
+    -- The readability tests chmod their fixtures, and an assertion failing
+    -- would leave the tightened mode in place.  Restoring here keeps a red run
+    -- from leaving the tree unreadable.  Explicit modes: `a+r` would turn 600
+    -- back into 666 instead of 644.
+    after_each(function()
+        os.execute("chmod 644 " .. no_read_file)
+        os.execute("chmod 755 " .. no_read_dir)
+    end)
+
     -- Check filesystem.make_directories
     it('Check filesystem.make_directories', function()
         assert.is_true(gfs.make_directories(root .. "filesystem_tests/x/y"))
@@ -20,13 +55,17 @@ describe("gears.filesystem", function()
 
     -- Check filesystem.file_readable
     it('Check filesystem.file_readable', function()
-        os.execute("chmod g-r,o-r,a-r " .. root .. "filesystem_tests/x/NoRead")
+        local untestable = untestable_without_others(no_read_file)
+
+        os.execute("chmod g-r,o-r,a-r " .. no_read_file)
 
         assert.is_true(gfs.file_readable(root .. "filesystem_tests/x/Read"))
-        assert.is_false(gfs.file_readable(root .. "filesystem_tests/x/NoRead"))
         assert.is_nil(gfs.file_readable(root .. "filesystem_tests/x/NO_FILE"))
 
-        os.execute("chmod g+r,o+r,a+r " .. root .. "filesystem_tests/x/NoRead")
+        if untestable then
+            pending(untestable)
+        end
+        assert.is_false(gfs.file_readable(no_read_file))
     end)
 
     -- Check filesystem.file_executable
@@ -38,13 +77,17 @@ describe("gears.filesystem", function()
 
     -- Check filesystem.dir_readable
     it('Check filesystem.dir_readable', function()
-        os.execute("chmod g-r,o-r,a-r " .. root .. "filesystem_tests/y")
+        local untestable = untestable_without_others(no_read_dir)
+
+        os.execute("chmod g-r,o-r,a-r " .. no_read_dir)
 
         assert.is_true(gfs.dir_readable(root .. "filesystem_tests/x"))
-        assert.is_false(gfs.dir_readable(root .. "filesystem_tests/y"))
         assert.is_nil(gfs.dir_readable(root .. "filesystem_tests/NO_DIR"))
 
-        os.execute("chmod g+r,o+r,a+r " .. root .. "filesystem_tests/y")
+        if untestable then
+            pending(untestable)
+        end
+        assert.is_false(gfs.dir_readable(no_read_dir))
     end)
 
     -- Check filesystem.is_dir
