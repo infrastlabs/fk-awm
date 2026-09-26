@@ -370,11 +370,7 @@ local function paint()
 
     -- Set the wallpaper.
     local pattern = cairo.Pattern.create_for_surface(target)
-    -- lgishim 的 cairo 对象是 full userdata(wrap{ptr,destroy,cls})，而
-    -- root.c 的 luaA_root_wallpaper 要的是 lightuserdata(见 root.c:488/503)。
-    -- 传 full userdata 时 cairo_set_source 拿到垃圾指针并静默失败，根窗口
-    -- 壁纸因此是纯黑。这里取 _native 取出真正的 cairo_pattern_t*。
-    capi.root.wallpaper(pattern:_native())
+    capi.root.wallpaper(pattern)
 
     -- Limit some potential GC induced increase in memory usage.
     -- But really, is someone is trying to apply wallpaper changes more
