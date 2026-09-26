@@ -288,6 +288,31 @@ m_native(lua_State *L)
     return 1;
 }
 
+/*
+ * `_native` is registered as a PROPERTY GETTER, not as a metatable field.
+ * m_index's property-getter path auto-invokes the closure with obj as its
+ * argument and returns the resulting value, so `obj._native` is the raw
+ * G* pointer (lightuserdatum). A metatable field would hand back the
+ * closure itself, and lua_touserdata() on a Lua function yields NULL --
+ * exactly the trap that black-screened the root wallpaper, because
+ * lib/awful/_compat.lua:71 does `pcall(function() return pattern._native end)`
+ * and then passes `pattern._native` straight to root._wallpaper()
+ * (root.c:503 casts it via lua_touserdata).
+ *
+ * lgishim_pixbuf.c documents the same reasoning for GdkPixbuf. lgishim_gobject.c
+ * carries the identical NATIVE_PG table with a matching comment (lines 619-632).
+ * cairo / pango / glib / gio shims used to put _native on the metatable, which
+ * broke every lib/ call site of the form `X._native` (wibox shape, snap,
+ * client/shape, _compat root.wallpaper). This is the last of them to be fixed.
+ *
+ * Note: gio's clsinfo has no "g" field -- its property getters live in "p"
+ * (auto-invoked with obj as self, see m_index), so NATIVE_PG goes there.
+ */
+static const luaL_Reg NATIVE_PG[] = {
+    { "_native", m_native },
+    { NULL, NULL },
+};
+
 static void
 release(wrap *w)
 {
@@ -350,8 +375,10 @@ make_class_table(lua_State *L, int cls, const luaL_Reg *m, const luaL_Reg *p)
     lua_setfield(L, -2, "__index");
     lua_pushcfunction(L, m_newindex);
     lua_setfield(L, -2, "__newindex");
-    lua_pushcfunction(L, m_native);
-    lua_setfield(L, -2, "_native");
+    /* NOTE: `_native` used to be registered here on the metatable, which made
+     * `X._native` return the closure instead of the raw pointer (see NATIVE_PG
+     * above). It is now a property getter in the per-class "p" table below so
+     * m_index auto-invokes it. */
     lua_pushcfunction(L, m_finish);
     lua_setfield(L, -2, "finish");
     lua_pushcfunction(L, m_gc);
@@ -370,11 +397,11 @@ make_class_table(lua_State *L, int cls, const luaL_Reg *m, const luaL_Reg *p)
     lua_newtable(L);
     luaL_setfuncs(L, m, 0);
     lua_setfield(L, -2, "m");
-    if (p) {
-        lua_newtable(L);
+    lua_newtable(L);
+    luaL_setfuncs(L, NATIVE_PG, 0);            /* always: _native (property getter) */
+    if (p)
         luaL_setfuncs(L, p, 0);
-        lua_setfield(L, -2, "p");
-    }
+    lua_setfield(L, -2, "p");
     lua_rawseti(L, -2, cls);
     lua_pop(L, 1);                             /* registry array */
 
