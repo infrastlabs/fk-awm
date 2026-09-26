@@ -43,7 +43,14 @@
 #include <lauxlib.h>
 #include <lua.h>
 
+#include <png.h>
+#include <jpeglib.h>
+
+#include <ctype.h>
+#include <setjmp.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <cairo.h>
@@ -303,6 +310,492 @@ class_setup(lua_State *L, int cls, const luaL_Reg *m,
     make_class_table(L, cls, m);
 }
 
+/* ----------------------------------------------------------- image decoders
+ *
+ * gdk-pixbuf's normal gdk_pixbuf_new_from_file() dispatches through its
+ * loader-plugin mechanism, which needs g_module + a loaders.cache to find
+ * libpixbufloader-*.so.  Neither is usable in this fully-static build
+ * (docs/sam/2026-09-25-record3.md §10), so we sniff the magic bytes here
+ * and decode the three formats the callers actually need -- PNG, JPEG, XPM
+ * -- directly against the linked libraries.  The pixbuf we return has the
+ * same shape a gdk-pixbuf loader would produce: GDK_COLORSPACE_RGB, 8
+ * bits per sample, [R,G,B,A] in memory (or [R,G,B] for no-alpha JPEG),
+ * which is what draw.c:85's draw_surface_from_pixbuf() reads.  The pixbuf
+ * owns its own copy of the pixel data, so d_pixbuf's g_object_unref
+ * releases it exactly once.
+ */
+
+static unsigned char *
+read_whole_file(const char *path, size_t *out_len)
+{
+    FILE *fp = fopen(path, "rb");
+    unsigned char *buf;
+    size_t cap = 4096, len = 0, n;
+
+    if (!fp)
+        return NULL;
+    buf = malloc(cap);
+    if (!buf) { fclose(fp); return NULL; }
+    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += n;
+        if (len == cap) {
+            unsigned char *nb;
+            cap *= 2;
+            nb = realloc(buf, cap);
+            if (!nb) { free(buf); fclose(fp); return NULL; }
+            buf = nb;
+        }
+    }
+    fclose(fp);
+    *out_len = len;
+    return buf;
+}
+
+/* PNG: libpng 1.5+ simplified png_image_* API.  The version field must be
+ * set to PNG_IMAGE_VERSION before begin_read, else it fails with
+ * "incorrect PNG_IMAGE_VERSION".  We supply our own buffer to
+ * png_image_finish_read and it cleans up the png_image on return.  With
+ * PNG_FORMAT_RGBA libpng writes [R,G,B,A], matching GdkPixbuf's memory
+ * order (see the probe in docs/sam/2026-09-25-record3.md §10.3). */
+static GdkPixbuf *
+decode_png(const unsigned char *data, size_t len, char *err, size_t errsz)
+{
+    png_image img;
+    unsigned char *buf, *dst;
+    GdkPixbuf *pixbuf;
+    size_t rs, ds;
+    png_uint_32 y;
+    int has_alpha, bpp;
+
+    memset(&img, 0, sizeof(img));
+    img.version = PNG_IMAGE_VERSION;
+    if (png_image_begin_read_from_memory(&img, data, len) == 0) {
+        snprintf(err, errsz, "png: cannot read header");
+        return NULL;
+    }
+    has_alpha = (img.format & PNG_FORMAT_FLAG_ALPHA) != 0;
+    bpp = has_alpha ? 4 : 3;
+    img.format = has_alpha ? PNG_FORMAT_RGBA : PNG_FORMAT_RGB;
+
+    buf = malloc((size_t)img.width * (size_t)img.height * bpp);
+    if (!buf) {
+        snprintf(err, errsz, "png: out of memory (%lux%lu)",
+                 (unsigned long)img.width, (unsigned long)img.height);
+        png_image_free(&img);
+        return NULL;
+    }
+    if (png_image_finish_read(&img, NULL, buf,
+                              img.width * bpp, NULL) == 0) {
+        snprintf(err, errsz, "png: cannot decode pixel data");
+        free(buf);
+        return NULL;
+    }
+    pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, has_alpha, 8,
+                            img.width, img.height);
+    if (!pixbuf) {
+        snprintf(err, errsz, "png: pixbuf alloc failed (%lux%lu)",
+                 (unsigned long)img.width, (unsigned long)img.height);
+        free(buf);
+        return NULL;
+    }
+    dst = gdk_pixbuf_get_pixels(pixbuf);
+    ds = (size_t)gdk_pixbuf_get_rowstride(pixbuf);
+    rs = (size_t)img.width * bpp;
+    for (y = 0; y < img.height; y++)
+        memcpy(dst + (size_t)y * ds, buf + (size_t)y * rs, rs);
+    free(buf);
+    return pixbuf;
+}
+
+/* JPEG: libjpeg's default error_exit() calls exit(), so we override it via
+ * setjmp/longjmp with a stack jmp_buf.  The jmp_buf, cinfo and any pointer
+ * we still read after the longjmp are declared volatile-free because C
+ * allows non-volatile stack locals to be inspected across a longjmp to
+ * their previous value, which is exactly what we want.  jpeg_mem_src()
+ * reads from our already-loaded buffer, so no FILE* juggling. */
+typedef struct {
+    struct jpeg_error_mgr pub;
+    jmp_buf jb;
+    char msg[256];
+} jmp_err_mgr;
+
+static void
+jpeg_error_exit(j_common_ptr cinfo)
+{
+    jmp_err_mgr *st = (jmp_err_mgr *)cinfo->err;
+    (*cinfo->err->format_message)(cinfo, st->msg);
+    longjmp(st->jb, 1);
+}
+
+static GdkPixbuf *
+decode_jpeg(const unsigned char *data, size_t len, char *err, size_t errsz)
+{
+    struct jpeg_decompress_struct cinfo;
+    jmp_err_mgr jerr;
+    unsigned char *scanbuf, *dst;
+    GdkPixbuf *pixbuf;
+    JDIMENSION y;
+    JSAMPROW rowp;
+    size_t rs, ds;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit;
+    cinfo.err = (struct jpeg_error_mgr *)&jerr;
+
+    if (setjmp(jerr.jb)) {
+        jpeg_destroy_decompress(&cinfo);
+        snprintf(err, errsz, "jpeg: %s", jerr.msg);
+        return NULL;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, (unsigned long)len);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        snprintf(err, errsz, "jpeg: bad header");
+        return NULL;
+    }
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8,
+                            (int)cinfo.output_width,
+                            (int)cinfo.output_height);
+    if (!pixbuf) {
+        jpeg_abort_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        snprintf(err, errsz, "jpeg: pixbuf alloc failed");
+        return NULL;
+    }
+    scanbuf = malloc((size_t)cinfo.output_width * 3);
+    if (!scanbuf) {
+        jpeg_abort_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        g_object_unref(pixbuf);
+        snprintf(err, errsz, "jpeg: out of memory");
+        return NULL;
+    }
+    dst = gdk_pixbuf_get_pixels(pixbuf);
+    ds = (size_t)gdk_pixbuf_get_rowstride(pixbuf);
+    rs = (size_t)cinfo.output_width * 3;
+    for (y = 0; y < cinfo.output_height; y++) {
+        rowp = scanbuf;
+        if (jpeg_read_scanlines(&cinfo, &rowp, 1) != 1) {
+            jpeg_abort_decompress(&cinfo);
+            jpeg_destroy_decompress(&cinfo);
+            g_object_unref(pixbuf);
+            free(scanbuf);
+            snprintf(err, errsz, "jpeg: read failure at row %lu",
+                     (unsigned long)y);
+            return NULL;
+        }
+        memcpy(dst + (size_t)y * ds, scanbuf, rs);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    free(scanbuf);
+    return pixbuf;
+}
+
+/* XPM: parse the file (already in memory) into a NULL-terminated char**
+ * array of C-string-literal contents, then hand that to
+ * gdk_pixbuf_new_from_xpm_data.  That function is compiled into core
+ * libgdk_pixbuf (nm shows T gdk_pixbuf_new_from_xpm_data), NOT a loader
+ * plugin, so it works in the static build.  The parser handles the C
+ * escapes XPM actually uses: \n \t \r \a \b \f \v \\ \" \' \xNN \NNN,
+ * and \<newline> line continuations for long pixel rows. */
+static const char **
+parse_xpm_strings(const char *src, size_t len, char *err, size_t errsz)
+{
+    const char **out = NULL;
+    char **strings;
+    char *cur = NULL;
+    size_t cap = 128, nstr = 0;
+    size_t cur_len = 0, cur_cap = 0;
+    size_t i = 0, k;
+
+    strings = malloc(cap * sizeof(*strings));
+    if (!strings) {
+        snprintf(err, errsz, "xpm: out of memory");
+        return NULL;
+    }
+
+#define PUSH_STR() do { \
+    if (nstr >= cap) { \
+        size_t ncap = cap * 2; \
+        char **ns = realloc(strings, ncap * sizeof(*ns)); \
+        if (!ns) { snprintf(err, errsz, "xpm: out of memory"); goto fail; } \
+        strings = ns; cap = ncap; \
+    } \
+    if (cur_len > 0) { \
+        char *s = malloc(cur_len + 1); \
+        if (!s) { snprintf(err, errsz, "xpm: out of memory"); goto fail; } \
+        memcpy(s, cur, cur_len); s[cur_len] = '\0'; \
+        strings[nstr++] = s; \
+        cur_len = 0; \
+    } \
+} while (0)
+
+#define PUSH_CHAR(c) do { \
+    if (cur_len + 2 >= cur_cap) { \
+        size_t ncap = cur_cap * 2 + 16; \
+        char *nc = realloc(cur, ncap); \
+        if (!nc) { snprintf(err, errsz, "xpm: out of memory"); goto fail; } \
+        cur = nc; cur_cap = ncap; \
+    } \
+    cur[cur_len++] = (char)(c); \
+} while (0)
+
+    while (i < len) {
+        if (src[i] != '"') { i++; continue; }
+        i++;
+        while (i < len && src[i] != '"') {
+            char c = src[i++];
+            if (c != '\\') { PUSH_CHAR(c); continue; }
+            if (i >= len) {
+                snprintf(err, errsz, "xpm: trailing backslash");
+                goto fail;
+            }
+            c = src[i++];
+            switch (c) {
+            case 'n': PUSH_CHAR('\n'); break;
+            case 't': PUSH_CHAR('\t'); break;
+            case 'r': PUSH_CHAR('\r'); break;
+            case 'a': PUSH_CHAR('\a'); break;
+            case 'b': PUSH_CHAR('\b'); break;
+            case 'f': PUSH_CHAR('\f'); break;
+            case 'v': PUSH_CHAR('\v'); break;
+            case '\\': PUSH_CHAR('\\'); break;
+            case '"': PUSH_CHAR('"'); break;
+            case '\'': PUSH_CHAR('\''); break;
+            case '\n': case '\r': break;  /* line continuation */
+            case 'x': case 'X': {
+                char hb[8]; int nd = 0;
+                while (nd < 2 && i < len && isxdigit((unsigned char)src[i]))
+                    hb[nd++] = src[i++];
+                hb[nd] = '\0';
+                if (nd == 0) {
+                    snprintf(err, errsz, "xpm: bad hex escape");
+                    goto fail;
+                }
+                PUSH_CHAR(strtoul(hb, NULL, 16));
+                break;
+            }
+            case '0': case '1': case '2': case '3':
+            case '4': case '5': case '6': case '7': {
+                char ob[8]; int nd = 0;
+                ob[nd++] = c;
+                while (nd < 3 && i < len &&
+                       src[i] >= '0' && src[i] <= '7')
+                    ob[nd++] = src[i++];
+                ob[nd] = '\0';
+                PUSH_CHAR(strtoul(ob, NULL, 8));
+                break;
+            }
+            default:
+                PUSH_CHAR('\\'); PUSH_CHAR(c);
+                break;
+            }
+        }
+        if (i < len) i++;  /* skip closing quote */
+        PUSH_STR();
+    }
+    PUSH_STR();
+
+    out = malloc((nstr + 1) * sizeof(*out));
+    if (!out) { snprintf(err, errsz, "xpm: out of memory"); goto fail; }
+    for (k = 0; k < nstr; k++)
+        out[k] = strings[k];
+    out[nstr] = NULL;
+#undef PUSH_STR
+#undef PUSH_CHAR
+    return out;
+fail:
+    for (k = 0; k < nstr; k++)
+        free(strings[k]);
+    free(strings);
+    free(cur);
+#undef PUSH_STR
+#undef PUSH_CHAR
+    return NULL;
+}
+static GdkPixbuf *
+decode_xpm(const char *data, size_t len, char *err, size_t errsz)
+{
+    const char **strs = parse_xpm_strings(data, len, err, errsz);
+    GdkPixbuf *pixbuf = NULL;
+    unsigned char *pixels = NULL;
+    int width, height, ncolors, cpp, has_alpha = 0;
+    unsigned char *palette;
+    int row, col, si, k;
+    size_t ds;
+    const char *s;
+
+    if (!strs)
+        return NULL;
+
+    /* Header: "width height ncolors cpp" */
+    if (sscanf(strs[0], "%d %d %d %d", &width, &height, &ncolors, &cpp)
+            != 4 || width <= 0 || height <= 0 || ncolors <= 0 ||
+            cpp < 1 || cpp > 4) {
+        snprintf(err, errsz, "xpm: bad header");
+        goto cleanup;
+    }
+
+    palette = calloc((size_t)ncolors, 4);
+    if (!palette) {
+        snprintf(err, errsz, "xpm: out of memory");
+        goto cleanup;
+    }
+
+    /* Colors: strs[1..ncolors] are "key c color_string" where key is
+     * exactly cpp characters at the start of the string.  A space key
+     * (e.g. " 	c None") means transparent.  We skip past the key, any
+     * whitespace, the 'c', more whitespace, and land on the color. */
+    for (si = 1; si <= ncolors && si < (int)height + ncolors + 1; si++) {
+        unsigned char r = 0, g = 0, b = 0, a = 255;
+        if (!strs[si]) {
+            snprintf(err, errsz, "xpm: truncated color table");
+            goto cleanup;
+        }
+        s = strs[si];
+        if (strlen(s) < (size_t)cpp + 2)
+            continue;
+        s += cpp;  /* skip key */
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (*s != 'c' && *s != 'C')
+            continue;
+        s++;
+        while (*s == ' ' || *s == '\t')
+            s++;
+
+        if (strcmp(s, "None") == 0) {
+            a = 0;
+            has_alpha = 1;
+        } else if (s[0] == '#') {
+            const char *h = s + 1;
+            size_t hl = strlen(h);
+            unsigned int u[4] = {0, 0, 0, 255};
+            if (hl == 6) {
+                sscanf(h, "%2x%2x%2x", &u[0], &u[1], &u[2]);
+                r = (unsigned char)u[0];
+                g = (unsigned char)u[1];
+                b = (unsigned char)u[2];
+            } else if (hl == 8) {
+                sscanf(h, "%2x%2x%2x%2x", &u[0], &u[1], &u[2], &u[3]);
+                a = (unsigned char)u[0];
+                r = (unsigned char)u[1];
+                g = (unsigned char)u[2];
+                b = (unsigned char)u[3];
+                has_alpha = 1;
+            } else if (hl == 12) {
+                sscanf(h, "%4x%4x%4x", &u[0], &u[1], &u[2]);
+                r = (unsigned char)(u[0] >> 8);
+                g = (unsigned char)(u[1] >> 8);
+                b = (unsigned char)(u[2] >> 8);
+            } else if (hl == 16) {
+                sscanf(h, "%4x%4x%4x%4x", &u[0], &u[1], &u[2], &u[3]);
+                a = (unsigned char)(u[0] >> 8);
+                r = (unsigned char)(u[1] >> 8);
+                g = (unsigned char)(u[2] >> 8);
+                b = (unsigned char)(u[3] >> 8);
+                has_alpha = 1;
+            }
+        } else if (strncmp(s, "rgb:", 4) == 0 ||
+                   strncmp(s, "rgba:", 5) == 0) {
+            const char *p = strchr(s, ':') + 1;
+            char tok[64]; int ti, nv = 0;
+            unsigned int vals[4] = {0};
+            while (*p && nv < 4) {
+                ti = 0;
+                while (*p && *p != '/' && ti < 63)
+                    tok[ti++] = *p++;
+                tok[ti] = '\0';
+                if (ti > 0)
+                    vals[nv++] = strtoul(tok, NULL, 16);
+                if (*p == '/') p++;
+            }
+            {
+                int scale = (vals[0] > 255 || vals[1] > 255 ||
+                             vals[2] > 255) ? 257 : 1;
+                r = (unsigned char)(vals[0] / scale);
+                g = (unsigned char)(vals[1] / scale);
+                b = (unsigned char)(vals[2] / scale);
+                if (nv >= 4) {
+                    a = (unsigned char)(vals[3] / scale);
+                    has_alpha = 1;
+                }
+            }
+        }
+        palette[(si - 1) * 4 + 0] = r;
+        palette[(si - 1) * 4 + 1] = g;
+        palette[(si - 1) * 4 + 2] = b;
+        palette[(si - 1) * 4 + 3] = a;
+    }
+
+    pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, has_alpha, 8,
+                            width, height);
+    if (!pixbuf) {
+        snprintf(err, errsz, "xpm: pixbuf alloc failed (%dx%d)",
+                 width, height);
+        goto cleanup;
+    }
+    pixels = gdk_pixbuf_get_pixels(pixbuf);
+    ds = (size_t)gdk_pixbuf_get_rowstride(pixbuf);
+
+    /* Pixel rows: strs[ncolors+1 .. ncolors+height].  Each row has
+     * width*cpp characters; every cpp chars is a key into the palette. */
+    k = ncolors + 1;
+    for (row = 0; row < height && k < (int)height + ncolors + 1; row++) {
+        if (!strs[k]) break;
+        s = strs[k];
+        if ((int)strlen(s) < width * cpp) break;
+        for (col = 0; col < width; col++) {
+            unsigned char r = 0, g = 0, b = 0, a = 0;
+            int found = 0;
+            for (si = 0; si < ncolors && !found; si++) {
+                const char *ck = strs[si + 1];
+                int ok = 1, jj;
+                if (!ck) { ok = 0; }
+                else {
+                    for (jj = 0; jj < cpp; jj++)
+                        if (ck[jj] != s[col * cpp + jj]) { ok = 0; break; }
+                    if (ok && jj == cpp) {
+                        r = palette[si * 4];
+                        g = palette[si * 4 + 1];
+                        b = palette[si * 4 + 2];
+                        a = palette[si * 4 + 3];
+                        found = 1;
+                    }
+                }
+            }
+            if (has_alpha) {
+                unsigned char *q = pixels + (size_t)row * ds +
+                                    (size_t)col * 4;
+                q[0] = r; q[1] = g; q[2] = b; q[3] = a;
+            } else {
+                unsigned char *q = pixels + (size_t)row * ds +
+                                    (size_t)col * 3;
+                q[0] = r; q[1] = g; q[2] = b;
+            }
+        }
+        k++;
+    }
+    if (k - ncolors - 1 < height) {
+        snprintf(err, errsz, "xpm: only %d of %d pixel rows",
+                 k - ncolors - 1, height);
+        g_object_unref(pixbuf);
+        pixbuf = NULL;
+    }
+
+cleanup:
+    for (k = 0; strs[k]; k++)
+        free((char *)strs[k]);
+    free((void *)strs);
+    free(palette);
+    return pixbuf;
+}
 /* ================================================================ API
  *
  * Return-value conventions dictated by lib/:
@@ -319,15 +812,54 @@ static int
 pixbuf_new_from_file(lua_State *L)
 {
     const char *path;
-    GdkPixbuf *pixbuf;
+    GdkPixbuf *pixbuf = NULL;
     GError *error = NULL;
+    unsigned char *data = NULL;
+    char errbuf[512];
+    size_t len = 0;
+    int attempted = 0;
 
     /* luaL_checkstring raises on non-string; lib/ always passes a string
      * (surface.lua:59 only reaches here inside `type(_surface)=="string"`). */
     path = luaL_checkstring(L, 1);
 
-    pixbuf = gdk_pixbuf_new_from_file(path, &error);
+    /* Sniff magic bytes ourselves so the three formats gdk-pixbuf would
+     * normally load via plugins are decodable in the static build.  We
+     * read the whole file once -- small for icons, and we'd otherwise
+     * open it twice (sniff + decode).  The decoders copy out of `data`
+     * into the pixbuf, so we free it before handing back. */
+    data = read_whole_file(path, &len);
+    if (data) {
+        if (len >= 8 && memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0) {
+            pixbuf = decode_png(data, len, errbuf, sizeof(errbuf));
+            attempted = 1;
+        } else if (len >= 3 && data[0] == 0xFF &&
+                   data[1] == 0xD8 && data[2] == 0xFF) {
+            pixbuf = decode_jpeg(data, len, errbuf, sizeof(errbuf));
+            attempted = 1;
+        } else if (len >= 7 && memcmp(data, "/* XPM */", 7) == 0) {
+            pixbuf = decode_xpm((const char *)data, len, errbuf,
+                                sizeof(errbuf));
+            attempted = 1;
+        }
+        free(data);
+        data = NULL;
+    }
+
+    /* For anything else -- TIFF, BMP, SVG, a missing file -- let gdk-pixbuf
+     * produce its own error message (e.g. "could not find an origin for
+     * this loader" for a format we didn't sniff).  Falling through here
+     * preserves the pre-existing "unknown format" error the caller gets. */
+    if (!pixbuf && !attempted)
+        pixbuf = gdk_pixbuf_new_from_file(path, &error);
+
     if (!pixbuf) {
+        if (attempted) {
+            /* our decoder failed: errbuf holds the message */
+            lua_pushnil(L);
+            lua_pushstring(L, errbuf);
+            return 2;
+        }
         if (!error)
             error = g_error_new_literal(GDK_PIXBUF_ERROR,
                                         GDK_PIXBUF_ERROR_FAILED,
