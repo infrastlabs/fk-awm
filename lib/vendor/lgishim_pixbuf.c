@@ -57,6 +57,10 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib-object.h>
 
+#ifdef HAVE_LIBRSVG
+#include <librsvg/rsvg.h>
+#endif
+
 /* Exported to luaa.c, which registers it in package.preload. */
 int luaopen_lgishim_pixbuf(lua_State *L);
 
@@ -808,6 +812,92 @@ cleanup:
  *     _native in a closure, draw_surface_from_pixbuf(NULL) would deref.
  */
 
+/* ---- SVG (optional, built with HAVE_LIBRSVG) --------------------------- */
+
+#ifdef HAVE_LIBRSVG
+static GdkPixbuf *surface_to_pixbuf(cairo_surface_t *surface, int sx, int sy,
+                                    int w, int h);
+
+/* Sniff: after optional UTF-8 BOM + leading whitespace (and a possible
+ * <?xml?> prolog), the root element is <svg.  Icons are small and always
+ * put <svg near the start, so scanning the first 1 KiB is enough. */
+static int
+is_svg(const unsigned char *data, size_t len)
+{
+    size_t i;
+    i = 0;
+    if (len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF)
+        i = 3;
+    while (i < len && (data[i] == ' ' || data[i] == '\t' ||
+                       data[i] == '\r' || data[i] == '\n'))
+        i++;
+    for (; i < len; i++) {
+        if (i > 1024)
+            return 0;
+        if (i + 4 <= len && memcmp(data + i, "<svg", 4) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Decode an SVG stream via librsvg: render into a cairo image surface, then
+ * copy the pixels into a fresh GdkPixbuf (surface_to_pixbuf below).  librsvg
+ * 2.40 is the last C implementation (2.41+ is Rust), which is what the
+ * static build links.  On failure fill err and return NULL -- the caller
+ * turns that into the (nil, msg) pair surface.lua:59-62 destructures. */
+static GdkPixbuf *
+decode_svg(const unsigned char *data, size_t len, char *err, size_t errsz)
+{
+    GError *gerr = NULL;
+    RsvgHandle *handle = NULL;
+    RsvgDimensionData dims;
+    cairo_surface_t *surface = NULL;
+    cairo_t *cr = NULL;
+    GdkPixbuf *pixbuf = NULL;
+    int w, h;
+
+    handle = rsvg_handle_new_from_data((const guint8 *)data, (gsize)len,
+                                       &gerr);
+    if (!handle) {
+        snprintf(err, errsz, "%s", gerr ? gerr->message : "SVG parse error");
+        g_clear_error(&gerr);
+        return NULL;
+    }
+
+    rsvg_handle_get_dimensions(handle, &dims);
+    w = dims.width;
+    h = dims.height;
+    if (w <= 0 || h <= 0) {
+        snprintf(err, errsz, "SVG has no intrinsic size (%dx%d)", w, h);
+        goto out;
+    }
+
+    surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        snprintf(err, errsz, "cannot allocate %dx%d surface", w, h);
+        goto out;
+    }
+    cr = cairo_create(surface);
+    if (!rsvg_handle_render_cairo(handle, cr)) {
+        snprintf(err, errsz, "rsvg render failed");
+        goto out;
+    }
+    cairo_destroy(cr);
+    cr = NULL;
+
+    pixbuf = surface_to_pixbuf(surface, 0, 0, w, h);
+    if (!pixbuf)
+        snprintf(err, errsz, "surface_to_pixbuf failed");
+out:
+    if (cr)
+        cairo_destroy(cr);
+    if (surface)
+        cairo_surface_destroy(surface);
+    g_object_unref(handle);
+    return pixbuf;
+}
+#endif /* HAVE_LIBRSVG */
+
 static int
 pixbuf_new_from_file(lua_State *L)
 {
@@ -841,6 +931,11 @@ pixbuf_new_from_file(lua_State *L)
             pixbuf = decode_xpm((const char *)data, len, errbuf,
                                 sizeof(errbuf));
             attempted = 1;
+#ifdef HAVE_LIBRSVG
+        } else if (is_svg(data, len)) {
+            pixbuf = decode_svg(data, len, errbuf, sizeof(errbuf));
+            attempted = 1;
+#endif
         }
         free(data);
         data = NULL;
