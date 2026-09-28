@@ -645,7 +645,17 @@ push_traceback_h(lua_State *L)
 static void
 pcall_dispatch(lua_State *L, int nargs)
 {
-    if (lua_pcall(L, nargs, 1, push_traceback_h(L)) != 0) {
+    int errf = push_traceback_h(L);
+    if (errf != 0) {
+        /* the traceback is on top; move it just below the callback so
+         * lua_pcall's function lookup (e(top - nargs)) lands on the
+         * callback, whatever the residue below is.  Absolute index: fn is
+         * at gettop - nargs - 1 while the traceback sits on top. */
+        int fn = lua_gettop(L) - nargs - 1;
+        lua_insert(L, fn);
+        errf = fn;
+    }
+    if (lua_pcall(L, nargs, 1, errf) != 0) {
         g_printerr("lgishim_gio callback error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
     } else {
@@ -1387,13 +1397,14 @@ datain_read_line_finish(lua_State *L)
     gchar *pending = c->pending;
 
     c->pending = NULL;
-    c->pending_len = 0;
     if (!pending) {
+        c->pending_len = 0;
         lua_pushnil(L);
         lua_pushinteger(L, 0);
         return 2;
     }
     if (c->pending_is_error) {
+        c->pending_len = 0;
         lua_pushnil(L);
         lua_pushstring(L, pending);
         g_free(pending);
@@ -1401,6 +1412,7 @@ datain_read_line_finish(lua_State *L)
     }
     lua_pushstring(L, pending);
     lua_pushinteger(L, (lua_Integer)c->pending_len);
+    c->pending_len = 0;              /* reset after the length is pushed out */
     g_free(pending);
     return 2;
 }
