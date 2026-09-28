@@ -1346,6 +1346,7 @@ datain_read_line_async(lua_State *L)
     gchar *line = NULL;
     gsize len = 0;
     GError *err = NULL;
+    int errf;
 
     luaL_checktype(L, 4, LUA_TFUNCTION);
 
@@ -1364,10 +1365,14 @@ datain_read_line_async(lua_State *L)
     }
     g_clear_error(&err);
 
+    /* errfunc must sit below the function+args or lua_pcall's function
+     * lookup (top-nargs-1) lands on the first argument instead of the
+     * callback.  push_traceback_h first, then the callback + args. */
+    errf = push_traceback_h(L);
     lua_pushvalue(L, 4);                      /* callback */
     lua_pushvalue(L, 1);                      /* the stream */
     lua_pushnil(L);                           /* async result handle */
-    if (lua_pcall(L, 2, 0, push_traceback_h(L)) != 0) {
+    if (lua_pcall(L, 2, 0, errf) != 0) {
         g_printerr("lgishim_gio read_line_async error: %s\n",
                    lua_tostring(L, -1));
         lua_pop(L, 1);
