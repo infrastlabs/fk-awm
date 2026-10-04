@@ -647,10 +647,6 @@ pcall_dispatch(lua_State *L, int nargs)
 {
     int errf = push_traceback_h(L);
     if (errf != 0) {
-        /* the traceback is on top; move it just below the callback so
-         * lua_pcall's function lookup (e(top - nargs)) lands on the
-         * callback, whatever the residue below is.  Absolute index: fn is
-         * at gettop - nargs - 1 while the traceback sits on top. */
         int fn = lua_gettop(L) - nargs - 1;
         lua_insert(L, fn);
         errf = fn;
@@ -2271,7 +2267,10 @@ dispatch_bus_cb(GClosure *cl, GDBusConnection *conn, const gchar *name)
     else
         lua_pushnil(L);
     lua_pushstring(L, name ? name : "");
-    lua_insert(L, 1);                              /* [fn, conn, name] */
+    /* Do NOT normalize with lua_insert(L, 1): the top here is `name`, so it
+     * would move the name into slot 1 and pcall_dispatch would treat the
+     * bus name string as the callback.  Any residue below is fine --
+     * pcall_dispatch locates the callback as gettop - nargs - 1. */
     pcall_dispatch(L, 2);
 }
 
