@@ -647,6 +647,10 @@ const struct luaL_Reg awesome_root_methods[] =
     { "fake_input", luaA_root_fake_input },
     { "drawins", luaA_root_drawins },
     { "_wallpaper", luaA_root_wallpaper },
+    /* Public alias (upstream f9d7ac59): drawable.lua:126 calls
+     * capi.root.wallpaper() for pseudo-transparency; without it every
+     * redraw without a compositor raises "attempt to call a nil value". */
+    { "wallpaper", luaA_root_wallpaper },
     { "content", luaA_root_get_content},
     { "size", luaA_root_size },
     { "size_mm", luaA_root_size_mm },
