@@ -460,8 +460,27 @@ timeout_cb(gpointer user_data)
     lua_rawgeti(d->L, LUA_REGISTRYINDEX, d->ref);
     if (!lua_isfunction(d->L, -1))
         lua_pushboolean(d->L, 0);
-    else
-        lua_call(d->L, 0, 1);
+    else {
+        /* Protected call with traceback: a redraw/timer-chain error here
+         * must not unwind through the GLib source callback (the wibox
+         * drawable routes every redraw through timer.delayed_call). */
+        lua_getglobal(d->L, "debug");
+        lua_getfield(d->L, -1, "traceback");
+        lua_remove(d->L, -2);                 /* [fn][tb] */
+        if (lua_isfunction(d->L, -1)) {
+            int errf = lua_gettop(d->L);      /* tb */
+            lua_pushvalue(d->L, -2);          /* [fn][tb][fn] */
+            if (lua_pcall(d->L, 0, 1, errf) != 0) {
+                g_printerr("lgishim_glib timeout error: %s\n",
+                           lua_tostring(d->L, -1));
+                lua_pop(d->L, 1);
+                lua_pushboolean(d->L, 1);     /* keep the source alive */
+            }
+        } else {
+            lua_pop(d->L, 1);                 /* no debug.traceback: fallback */
+            lua_call(d->L, 0, 1);
+        }
+    }
 
     int ret = 0;
     if (lua_isboolean(d->L, -1))
