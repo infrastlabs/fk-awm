@@ -147,6 +147,11 @@ if(AWESOME_LGISHIM)
     list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PANGO_REQUIRED_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_PIXBUF_REQUIRED_INCLUDE_DIRS})
     list(APPEND AWESOME_REQUIRED_INCLUDE_DIRS ${LGISHIM_GIOUNIX_INCLUDE_DIRS})
+    # librsvg: static SVG decode in the pixbuf shim (lib/vendor/lgishim_pixbuf.c
+    # decode_svg).  Headers/.a come from v-tint2/build.sh (STATIC=yes); its pc
+    # has no pangocairo requirement, so it stays out of pkg_check_modules.
+    include_directories(/usr/local/include/librsvg-2.0)
+    add_definitions(-DHAVE_LIBRSVG)
     list(APPEND AWESOME_REQUIRED_LDFLAGS
         -Wl,--start-group
         -l:libpangocairo-1.0.a -l:libpangoft2-1.0.a -l:libpangoxft-1.0.a
@@ -156,6 +161,7 @@ if(AWESOME_LGISHIM)
         -lgmodule-2.0 -lgio-2.0 -lgobject-2.0 -lglib-2.0
         -l:libgdk_pixbuf-2.0.a
         -lexpat -lbz2 -lz -lpcre -lnettle -lffi -lintl
+        -l:librsvg-2.a -l:libcroco-0.6.a
         -Wl,--end-group)
 endif()
 
