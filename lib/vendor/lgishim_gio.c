@@ -1340,11 +1340,47 @@ datain_read_line(lua_State *L)
 }
 
 /*
- * read_line_async(priority, cancel, callback) -> runs inline and calls
- * callback(obj, nil). lib/awful/spawn.lua:522-545 then calls
- * obj:read_line_finish(res); the nil `res` is ignored, the stashed result is
- * what gets returned.
+ * read_line_async(priority, cancel, callback) -> reads one line now, stashes
+ * it, and dispatches callback(obj, nil) on the next main-loop iteration.
+ * lib/awful/spawn.lua:522-545 then calls obj:read_line_finish(res); the nil
+ * `res` is ignored, the stashed result is what gets returned.
+ *
+ * The dispatch MUST be deferred (g_idle_add), not inline: spawn.lua chains
+ * start_read -> read_line_async -> callback -> start_read once per line, and
+ * an inline call makes that recurse on the C stack for the whole stream --
+ * any multi-line output blows the stack ("C stack overflow") and the
+ * easy_async user callback never fires.
  */
+typedef struct {
+    lua_State *L;
+    int stream_ref;   /* the DataInputStream userdata (keeps datain_ctx alive) */
+    int cb_ref;
+} datain_async_cbdata;
+
+static gboolean
+datain_async_dispatch(gpointer user_data)
+{
+    datain_async_cbdata *d = user_data;
+    lua_State *L = d->L;
+    int errf;
+
+    /* [tb][cb][obj][nil] so lua_pcall's e(top-nargs) lands on the cb */
+    errf = push_traceback_h(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, d->cb_ref);      /* cb */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, d->stream_ref);  /* obj */
+    lua_pushnil(L);                                    /* async result handle */
+    if (lua_pcall(L, 2, 0, errf) != 0) {
+        g_printerr("lgishim_gio read_line_async error: %s\n",
+                   lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    luaL_unref(L, LUA_REGISTRYINDEX, d->cb_ref);
+    luaL_unref(L, LUA_REGISTRYINDEX, d->stream_ref);
+    lua_settop(L, 0);
+    g_free(d);
+    return G_SOURCE_REMOVE;
+}
+
 static int
 datain_read_line_async(lua_State *L)
 {
@@ -1352,7 +1388,7 @@ datain_read_line_async(lua_State *L)
     gchar *line = NULL;
     gsize len = 0;
     GError *err = NULL;
-    int errf;
+    datain_async_cbdata *d;
 
     luaL_checktype(L, 4, LUA_TFUNCTION);
 
@@ -1371,18 +1407,15 @@ datain_read_line_async(lua_State *L)
     }
     g_clear_error(&err);
 
-    /* errfunc must sit below the function+args or lua_pcall's function
-     * lookup (top-nargs-1) lands on the first argument instead of the
-     * callback.  push_traceback_h first, then the callback + args. */
-    errf = push_traceback_h(L);
-    lua_pushvalue(L, 4);                      /* callback */
-    lua_pushvalue(L, 1);                      /* the stream */
-    lua_pushnil(L);                           /* async result handle */
-    if (lua_pcall(L, 2, 0, errf) != 0) {
-        g_printerr("lgishim_gio read_line_async error: %s\n",
-                   lua_tostring(L, -1));
-        lua_pop(L, 1);
-    }
+    /* Defer the callback to the next main-loop iteration (see the comment
+     * above datain_async_dispatch). */
+    d = g_new0(datain_async_cbdata, 1);
+    d->L = L;
+    lua_pushvalue(L, 1);
+    d->stream_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pushvalue(L, 4);
+    d->cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    g_idle_add(datain_async_dispatch, d);
     return 0;
 }
 
