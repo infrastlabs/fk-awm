@@ -365,6 +365,31 @@ function surface.crop_surface(args)
     return ret
 end
 
+--- Save a cairo surface to a PNG file.
+-- Thin wrapper over `cairo.Surface:write_to_png` — mirrors the lgi-idiomatic
+-- name used by upstream themes (window preview thumbnails, tasklist icons).
+-- @tparam cairo.surface surf The surface to save.
+-- @tparam string path The output path.
+-- @return true on success, nil + error message on failure.
+-- @staticfct save_to_png
+function surface.save_to_png(surf, path)
+    if not (surf and path and type(surf) == "userdata") then
+        return nil, "gears.surface.save_to_png: expected (surf, path)"
+    end
+    local ok, err = pcall(function() surf:write_to_png(path) end)
+    if not ok then
+        return nil, "gears.surface.save_to_png: " .. tostring(err)
+    end
+    return true
+end
+
+-- Re-export cairo under the same key the upstream `gears.surface` API exposes.
+-- Some themes (bling window preview, pablonoya tasklist) do
+-- `local cairo = require("gears.surface").cairo` and expect to get the lgi
+-- cairo module back out. Under the lgishim shim this is the same object
+-- `require("vendor.lgishim").cairo`, so the export is a straight passthrough.
+surface.cairo = cairo
+
 return setmetatable(surface, surface.mt)
 
 -- vim: filetype=lua:expandtab:shiftwidth=4:tabstop=8:softtabstop=4:textwidth=80
