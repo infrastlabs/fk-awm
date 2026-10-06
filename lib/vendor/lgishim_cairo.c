@@ -100,6 +100,11 @@ cairo_surface_t *lgishim_cairo_check_surface(lua_State *L, int idx);
  * them. */
 PangoLayout *lgishim_pango_check_layout(lua_State *L, int idx);
 
+/* ctx_copy_path() lives with the PathData section (it is what gives PathData
+ * its only real input), but the Context method table must be written before it.
+ * This is the file's only forward declaration. */
+static int ctx_copy_path(lua_State *L);
+
 enum {
     C_CTX = 1,
     C_SURFACE = 2,
@@ -107,6 +112,7 @@ enum {
     C_FONT_OPTIONS = 4,
     C_MATRIX = 5,
     C_REGION = 6,
+    C_SCALED_FONT = 7,
     N_CAIRO_CLASSES
 };
 
@@ -118,6 +124,7 @@ static const char *CLS_NAMES[N_CAIRO_CLASSES] = {
     "lgishim.FontOptions",
     "lgishim.Matrix",
     "lgishim.Region",
+    "lgishim.ScaledFont",
 };
 
 #define REG_CLASSES "lgishim_classes"
@@ -135,6 +142,7 @@ static void d_surface(void *p) { cairo_surface_destroy((cairo_surface_t *)p); }
 static void d_pattern(void *p) { cairo_pattern_destroy((cairo_pattern_t *)p); }
 static void d_font_options(void *p)
 { cairo_font_options_destroy((cairo_font_options_t *)p); }
+static void d_scaled_font(void *p) { cairo_scaled_font_destroy((cairo_scaled_font_t *)p); }
 static void d_region(void *p) { cairo_region_destroy((cairo_region_t *)p); }
 static void d_noop(void *p) { (void)p; }
 
@@ -247,12 +255,16 @@ static const struct enumpair OPERATOR[] = {
     { "SOFT_LIGHT", CAIRO_OPERATOR_SOFT_LIGHT },
     { "DIFFERENCE", CAIRO_OPERATOR_DIFFERENCE },
     { "EXCLUSION", CAIRO_OPERATOR_EXCLUSION },
+    { "HSL_HUE", CAIRO_OPERATOR_HSL_HUE },
+    { "HSL_SATURATION", CAIRO_OPERATOR_HSL_SATURATION },
+    { "HSL_COLOR", CAIRO_OPERATOR_HSL_COLOR },
+    { "HSL_LUMINOSITY", CAIRO_OPERATOR_HSL_LUMINOSITY },
 };
 
 static const struct enumpair FORMAT[] = {
     { "INVALID", CAIRO_FORMAT_INVALID }, { "ARGB32", CAIRO_FORMAT_ARGB32 },
     { "RGB24", CAIRO_FORMAT_RGB24 }, { "A8", CAIRO_FORMAT_A8 },
-    { "A1", CAIRO_FORMAT_A1 },
+    { "A1", CAIRO_FORMAT_A1 }, { "RGB16_565", CAIRO_FORMAT_RGB16_565 },
 };
 
 static const struct enumpair CONTENT[] = {
@@ -292,6 +304,7 @@ static const struct enumpair STATUS[] = {
 static const struct enumpair ANTIALIAS[] = {
     { "DEFAULT", CAIRO_ANTIALIAS_DEFAULT }, { "NONE", CAIRO_ANTIALIAS_NONE },
     { "GRAY", CAIRO_ANTIALIAS_GRAY }, { "SUBPIXEL", CAIRO_ANTIALIAS_SUBPIXEL },
+    { "FAST", CAIRO_ANTIALIAS_FAST },
     { "GOOD", CAIRO_ANTIALIAS_GOOD }, { "BEST", CAIRO_ANTIALIAS_BEST },
 };
 
@@ -367,6 +380,78 @@ static const struct enumpair OVERLAP[] = {
     { "PART", CAIRO_REGION_OVERLAP_PART },
 };
 
+/* ---- Numeric enum tables --------------------------------------------- */
+
+/* install_enum() above writes STRING constants, which is what lib/ needs for
+ * cr.status == "SUCCESS" (wibox/drawable.lua) and for the same strings being
+ * handed back to the setters. The families below are different: lgi exposes
+ * them as NUMBERS (cairo.FontType.FT == 0, cairo.HintStyle.NONE == 1) and
+ * callers compare them arithmetically, so install_enum_num() writes the real
+ * C constant values instead. */
+
+static const struct enumpair FONT_TYPE[] = {
+    { "FT", CAIRO_FONT_TYPE_FT }, { "QUARTZ", CAIRO_FONT_TYPE_QUARTZ },
+    { "TOY", CAIRO_FONT_TYPE_TOY }, { "USER", CAIRO_FONT_TYPE_USER },
+    { "WIN32", CAIRO_FONT_TYPE_WIN32 },
+};
+
+static const struct enumpair DEVICE_TYPE[] = {
+    { "XLIB", CAIRO_DEVICE_TYPE_XLIB }, { "XCB", CAIRO_DEVICE_TYPE_XCB },
+    { "DRM", CAIRO_DEVICE_TYPE_DRM }, { "GL", CAIRO_DEVICE_TYPE_GL },
+    { "SCRIPT", CAIRO_DEVICE_TYPE_SCRIPT }, { "XML", CAIRO_DEVICE_TYPE_XML },
+};
+
+static const struct enumpair SUBPIXEL_ORDER[] = {
+    { "BGR", CAIRO_SUBPIXEL_ORDER_BGR },
+    { "DEFAULT", CAIRO_SUBPIXEL_ORDER_DEFAULT },
+    { "RGB", CAIRO_SUBPIXEL_ORDER_RGB },
+    { "VBGR", CAIRO_SUBPIXEL_ORDER_VBGR },
+    { "VRGB", CAIRO_SUBPIXEL_ORDER_VRGB },
+};
+
+static const struct enumpair HINT_METRICS[] = {
+    { "DEFAULT", CAIRO_HINT_METRICS_DEFAULT }, { "OFF", CAIRO_HINT_METRICS_OFF },
+    { "ON", CAIRO_HINT_METRICS_ON },
+};
+
+static const struct enumpair HINT_STYLE[] = {
+    { "DEFAULT", CAIRO_HINT_STYLE_DEFAULT }, { "FULL", CAIRO_HINT_STYLE_FULL },
+    { "MEDIUM", CAIRO_HINT_STYLE_MEDIUM }, { "NONE", CAIRO_HINT_STYLE_NONE },
+    { "SLIGHT", CAIRO_HINT_STYLE_SLIGHT },
+};
+
+/* Numeric twin of OVERLAP. lgi names the cairo_region_overlap_t family
+ * RegionOverlap with integer values; "Overlap" stays string-valued because
+ * region:contains_rectangle() round-trips through enum_to(). */
+static const struct enumpair REGION_OVERLAP[] = {
+    { "IN", CAIRO_REGION_OVERLAP_IN }, { "OUT", CAIRO_REGION_OVERLAP_OUT },
+    { "PART", CAIRO_REGION_OVERLAP_PART },
+};
+
+/* This build's cairo.h predates the surface version enums (they landed in
+ * 1.14/1.16, like CAIRO_ANTIALIAS_FAST did), so the documented encodings are
+ * spelt out here: major is the top 16 bits, minor the next 8, micro the low 8.
+ * They are pure constants -- no call site exists in this library. */
+static const struct enumpair PDF_VERSION[] = {
+    { "1_4", 0x10004 }, { "1_5", 0x10005 },
+};
+
+static const struct enumpair PS_LEVEL[] = {
+    { "2", 0x020100 }, { "3", 0x030100 },
+};
+
+static const struct enumpair SVG_VERSION[] = {
+    { "1_1", 0x10001 }, { "1_2", 0x10002 }, { "1_2_1", 0x10201 },
+};
+
+/* Numeric twin of PATH, which lgi spells PathDataType. "Path" stays
+ * string-valued so that the cairo.Path.MOVE_TO spelling already installed
+ * above keeps working. */
+static const struct enumpair PATH_DATA_TYPE[] = {
+    { "CLOSE_PATH", CAIRO_PATH_CLOSE_PATH }, { "CURVE_TO", CAIRO_PATH_CURVE_TO },
+    { "LINE_TO", CAIRO_PATH_LINE_TO }, { "MOVE_TO", CAIRO_PATH_MOVE_TO },
+};
+
 /* Install one enum table on the module (which must be at stack slot -1 at
  * call time). Leaves the module table on top. */
 static void
@@ -377,6 +462,22 @@ install_enum(lua_State *L, const char *fieldname,
     lua_newtable(L);
     for (i = 0; i < n; i++) {
         lua_pushstring(L, t[i].name);
+        lua_setfield(L, -2, t[i].name);
+    }
+    lua_setfield(L, -2, fieldname);
+}
+
+/* install_enum() with INTEGER values: the real cairo constants, the way lgi's
+ * introspected enum types come across. Used only for the tables no lib/ code
+ * feeds back into a setter, so no enum_from()/enum_to() change is needed. */
+static void
+install_enum_num(lua_State *L, const char *fieldname,
+                 const struct enumpair *t, size_t n)
+{
+    size_t i;
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        lua_pushinteger(L, t[i].value);
         lua_setfield(L, -2, t[i].name);
     }
     lua_setfield(L, -2, fieldname);
@@ -618,6 +719,17 @@ make_call_table(lua_State *L, const luaL_Reg *m)
     lua_pushcclosure(L, class_call, 0);
     lua_setfield(L, -2, "__call");
     lua_setmetatable(L, -2);
+}
+
+/* is_type_of for the value types whose instances are plain tables
+ * (TextExtents, FontExtents, RectangleList). There is no metatable to compare,
+ * so this degrades to a table check -- the strongest discriminator available,
+ * and the only one that cannot raise on an odd argument. */
+static int
+type_of_is_table(lua_State *L)
+{
+    lua_pushboolean(L, lua_istable(L, 2));
+    return 1;
 }
 
 /*
@@ -1643,6 +1755,71 @@ static const luaL_Reg PAT_M[] = {
     { NULL, NULL },
 };
 
+/* ---- Pattern subtypes -------------------------------------------------- */
+
+/* lgi gives each cairo_pattern_type_t its own class (LinearPattern.create,
+ * RadialPattern.create, SolidPattern.create_rgba, ...). They all wrap a plain
+ * cairo_pattern_t, so all of them reuse C_PATTERN's metatable --
+ * make_class_table() (above) is what makes that happen. That matters:
+ * Pattern:is_type_of() compares metatable identity (m_is_type_of), so a value
+ * produced by a subclass constructor still passes the parent check that
+ * lib/gears/color.lua:277 relies on. Splitting the subtypes onto their own
+ * metatables would have broken exactly that test, so none of them do. */
+
+static int solid_pattern_create_rgb(lua_State *L)
+{
+    return push_obj(L, cairo_pattern_create_rgb(
+        luaL_checknumber(L, 1), luaL_checknumber(L, 2), luaL_checknumber(L, 3)),
+        d_pattern, C_PATTERN);
+}
+
+static int solid_pattern_create_rgba(lua_State *L)
+{
+    return push_obj(L, cairo_pattern_create_rgba(
+        luaL_checknumber(L, 1), luaL_checknumber(L, 2),
+        luaL_checknumber(L, 3), luaL_checknumber(L, 4)),
+        d_pattern, C_PATTERN);
+}
+
+/* cairo_pattern_create_mesh, not the 1.16-spelled cairo_mesh_pattern_create. */
+static int mesh_pattern_create(lua_State *L)
+{
+    return push_obj(L, cairo_pattern_create_mesh(), d_pattern, C_PATTERN);
+}
+
+static const luaL_Reg SOLID_PATTERN_M[] = {
+    { "create_rgb", solid_pattern_create_rgb },
+    { "create_rgba", solid_pattern_create_rgba },
+    { NULL, NULL },
+};
+
+static const luaL_Reg LINEAR_PATTERN_M[] = {
+    { "create", pattern_create_linear },
+    { NULL, NULL },
+};
+
+static const luaL_Reg RADIAL_PATTERN_M[] = {
+    { "create", pattern_create_radial },
+    { NULL, NULL },
+};
+
+static const luaL_Reg SURFACE_PATTERN_M[] = {
+    { "create", pattern_create_for_surface },
+    { NULL, NULL },
+};
+
+static const luaL_Reg MESH_PATTERN_M[] = {
+    { "create", mesh_pattern_create },
+    { NULL, NULL },
+};
+
+/* Base class of the gradient family: there is no cairo_pattern_create(), so
+ * no constructor -- just the class table, which is_type_of() needs. */
+static const luaL_Reg GRADIENT_PATTERN_M[] = {
+    { "new", pattern_new },
+    { NULL, NULL },
+};
+
 /* ---- Context: state ---------------------------------------------------- */
 
 static int ctx_new(lua_State *L)
@@ -1849,6 +2026,33 @@ static int ctx_get_font_options(lua_State *L)
 
     cairo_get_font_options(chk(L, 1), fo);
     return push_obj(L, fo, d_font_options, C_FONT_OPTIONS);
+}
+
+/* ---- Context: font matrix / scaled font ------------------------------ */
+
+/* cairo_get_font_matrix() takes an IN/OUT buffer, not an out-pointer, so it
+ * gets a stack local and the result is copied out through push_matrix() --
+ * which heap-allocates, since the wrapper owns the pointer it is handed. */
+static int ctx_get_font_matrix(lua_State *L)
+{
+    cairo_matrix_t m;
+
+    cairo_get_font_matrix(chk(L, 1), &m);
+    return push_matrix(L, &m);
+}
+
+static int ctx_set_font_matrix(lua_State *L)
+{
+    cairo_set_font_matrix(chk(L, 1), chk_matrix(L, 2));
+    return 0;
+}
+
+static int ctx_set_font_options(lua_State *L)
+{
+    /* Borrows only: cairo keeps its own copy of the options, so the wrapper
+     * keeps ownership and is not invalidated the way set_source() does. */
+    cairo_set_font_options(chk(L, 1), (cairo_font_options_t *)chk(L, 2));
+    return 0;
 }
 
 static int ctx_clip(lua_State *L) { cairo_clip(chk(L, 1)); return 0; }
@@ -2201,30 +2405,95 @@ static int ctx_text_extents(lua_State *L)
     return 1;
 }
 
+/* Shared by ctx_font_extents() and scaled_font_extents(). This build uses the
+ * PRE-1.8 cairo_font_extents_t {ascent, descent, height, max_x_advance,
+ * max_y_advance} instead of the modern {x_size, y_size, x_bearing, y_bearing,
+ * ascent, descent}, so both name sets are exposed for code written against
+ * either API. */
+static int push_font_extents(lua_State *L, const cairo_font_extents_t *fe)
+{
+    lua_newtable(L);
+    lua_pushnumber(L, fe->ascent);        lua_setfield(L, -2, "ascent");
+    lua_pushnumber(L, fe->descent);       lua_setfield(L, -2, "descent");
+    lua_pushnumber(L, fe->height);        lua_setfield(L, -2, "height");
+    lua_pushnumber(L, fe->max_x_advance); lua_setfield(L, -2, "max_x_advance");
+    lua_pushnumber(L, fe->max_y_advance); lua_setfield(L, -2, "max_y_advance");
+    lua_pushnumber(L, fe->max_x_advance); lua_setfield(L, -2, "x_size");
+    lua_pushnumber(L, fe->height);        lua_setfield(L, -2, "y_size");
+    lua_pushnumber(L, 0.0);               lua_setfield(L, -2, "x_bearing");
+    lua_pushnumber(L, 0.0);               lua_setfield(L, -2, "y_bearing");
+    return 1;
+}
+
 static int ctx_font_extents(lua_State *L)
 {
     cairo_font_extents_t fe;
 
-    /* Returns void here. This build uses the PRE-1.8 struct
-     * {ascent, descent, height, max_x_advance, max_y_advance} instead of the
-     * modern {x_size, y_size, x_bearing, y_bearing, ascent, descent}. Both
-     * names are exposed so lib/ code written against either API works. */
+    /* Returns void in this build, so no status check. */
     cairo_font_extents(chk(L, 1), &fe);
+    return push_font_extents(L, &fe);
+}
+
+/* ---- TextExtents / FontExtents ----------------------------------------- */
+
+/* cr:text_extents() and cr:font_extents() keep returning PLAIN TABLES --
+ * wibox/widget/piechart.lua:37 reads ext.width off them -- so these classes
+ * are value types that only build that same table shape; there is no wrapped
+ * instance to hand back. new() takes the fields in struct order, and is_type_of
+ * is attached manually because make_call_table() creates no metatable. */
+
+static int text_extents_new(lua_State *L)
+{
     lua_newtable(L);
-    lua_pushnumber(L, fe.ascent);        lua_setfield(L, -2, "ascent");
-    lua_pushnumber(L, fe.descent);       lua_setfield(L, -2, "descent");
-    lua_pushnumber(L, fe.height);        lua_setfield(L, -2, "height");
-    lua_pushnumber(L, fe.max_x_advance); lua_setfield(L, -2, "max_x_advance");
-    lua_pushnumber(L, fe.max_y_advance); lua_setfield(L, -2, "max_y_advance");
-    lua_pushnumber(L, fe.max_x_advance); lua_setfield(L, -2, "x_size");
-    lua_pushnumber(L, fe.height);        lua_setfield(L, -2, "y_size");
-    lua_pushnumber(L, 0.0);              lua_setfield(L, -2, "x_bearing");
-    lua_pushnumber(L, 0.0);              lua_setfield(L, -2, "y_bearing");
+    lua_pushnumber(L, luaL_optnumber(L, 1, 0.0)); lua_setfield(L, -2, "x_bearing");
+    lua_pushnumber(L, luaL_optnumber(L, 2, 0.0)); lua_setfield(L, -2, "y_bearing");
+    lua_pushnumber(L, luaL_optnumber(L, 3, 0.0)); lua_setfield(L, -2, "width");
+    lua_pushnumber(L, luaL_optnumber(L, 4, 0.0)); lua_setfield(L, -2, "height");
+    lua_pushnumber(L, luaL_optnumber(L, 5, 0.0)); lua_setfield(L, -2, "x_advance");
+    lua_pushnumber(L, luaL_optnumber(L, 6, 0.0)); lua_setfield(L, -2, "y_advance");
     return 1;
 }
 
+static int font_extents_new(lua_State *L)
+{
+    double ascent = luaL_optnumber(L, 1, 0.0);
+    double descent = luaL_optnumber(L, 2, 0.0);
+    double height = luaL_optnumber(L, 3, 0.0);
+    double max_x_advance = luaL_optnumber(L, 4, 0.0);
+    double max_y_advance = luaL_optnumber(L, 5, 0.0);
+
+    /* Same five-field order as this build's cairo_font_extents_t, with the
+     * derived modern aliases filled in the way push_font_extents() reports
+     * them. */
+    lua_newtable(L);
+    lua_pushnumber(L, ascent);        lua_setfield(L, -2, "ascent");
+    lua_pushnumber(L, descent);       lua_setfield(L, -2, "descent");
+    lua_pushnumber(L, height);        lua_setfield(L, -2, "height");
+    lua_pushnumber(L, max_x_advance); lua_setfield(L, -2, "max_x_advance");
+    lua_pushnumber(L, max_y_advance); lua_setfield(L, -2, "max_y_advance");
+    lua_pushnumber(L, max_x_advance); lua_setfield(L, -2, "x_size");
+    lua_pushnumber(L, height);        lua_setfield(L, -2, "y_size");
+    lua_pushnumber(L, 0.0);           lua_setfield(L, -2, "x_bearing");
+    lua_pushnumber(L, 0.0);           lua_setfield(L, -2, "y_bearing");
+    return 1;
+}
+
+static const luaL_Reg TEXT_EXTENTS_M[] = {
+    { "new", text_extents_new },
+    { "is_type_of", type_of_is_table },
+    { NULL, NULL },
+};
+
+static const luaL_Reg FONT_EXTENTS_M[] = {
+    { "new", font_extents_new },
+    { "is_type_of", type_of_is_table },
+    { NULL, NULL },
+};
+
 static const luaL_Reg CTX_PG[] = {
     { "matrix", ctx_get_matrix },
+    { "font_matrix", ctx_get_font_matrix },
+    { "font_options", ctx_get_font_options },
     { "operator", ctx_get_operator },
     { "status", ctx_get_status },
     { "dashes", ctx_get_dash },
@@ -2249,6 +2518,8 @@ static const luaL_Reg CTX_P[] = {
     { "tolerance", ctx_set_tolerance },
     { "dashes", ctx_set_dash },
     { "font_size", ctx_set_font_size },
+    { "font_matrix", ctx_set_font_matrix },
+    { "font_options", ctx_set_font_options },
     { "matrix", ctx_set_matrix },
     { "source", ctx_set_source },
     { NULL, NULL },
@@ -2267,6 +2538,12 @@ static const luaL_Reg CTX_M[] = {
     { "set_matrix", ctx_set_matrix },
     { "get_matrix", ctx_get_matrix },
     { "reset_matrix", ctx_reset_matrix },
+    /* lgi also exposes these as get_/set_ methods, next to the property
+     * accessors above -- both forms have to work, callers differ. */
+    { "get_font_matrix", ctx_get_font_matrix },
+    { "set_font_matrix", ctx_set_font_matrix },
+    { "get_font_options", ctx_get_font_options },
+    { "set_font_options", ctx_set_font_options },
     { "user_to_device_distance", ctx_user_to_device_distance },
     { "set_operator", ctx_set_operator },
     { "get_operator", ctx_get_operator },
@@ -2315,6 +2592,7 @@ static const luaL_Reg CTX_M[] = {
     { "circle", ctx_circle },
     { "close_path", ctx_close_path },
     { "path_close", ctx_path_close },
+    { "copy_path", ctx_copy_path },
     { "fill", ctx_fill },
     { "fill_preserve", ctx_fill_preserve },
     { "stroke", ctx_stroke },
@@ -2356,6 +2634,135 @@ static const luaL_Reg RECT_M[] = {
     { "new", rectangle_new },
     { NULL, NULL },
 };
+
+/* ---- PathData / Path.pairs ------------------------------------------- */
+
+/* cairo_path_data_t is a union: a {type, length} header and an {x, y} point.
+ * cairo reads a path as "one header followed by length-1 points", where
+ * length counts the header itself (CLOSE_PATH 1, MOVE_TO/LINE_TO 2,
+ * CURVE_TO 4). The GIR models the union as a struct carrying both variants,
+ * so that is the shape here too: PathData.new(type) starts an empty datum with
+ * the header's length already filled in for the type. */
+static int path_data_new(lua_State *L)
+{
+    int type = (int)luaL_optnumber(L, 1, (lua_Number)CAIRO_PATH_MOVE_TO);
+    int length;
+
+    switch (type) {
+    case CAIRO_PATH_CLOSE_PATH:
+        length = 1;
+        break;
+    case CAIRO_PATH_MOVE_TO:
+    case CAIRO_PATH_LINE_TO:
+        length = 2;
+        break;
+    case CAIRO_PATH_CURVE_TO:
+        length = 4;
+        break;
+    default:
+        /* A wrong length here would silently misread the following points,
+         * so it is an error rather than a guess. */
+        return luaL_error(L, "lgishim: PathData.new: unknown type %d", type);
+    }
+
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushinteger(L, type);   lua_setfield(L, -2, "type");
+    lua_pushinteger(L, length); lua_setfield(L, -2, "length");
+    lua_setfield(L, -2, "header");
+    lua_newtable(L);
+    lua_pushnumber(L, 0.0); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, 0.0); lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "point");
+    return 1;
+}
+
+static const luaL_Reg PATH_DATA_M[] = {
+    { "new", path_data_new },
+    { "is_type_of", type_of_is_table },
+    { NULL, NULL },
+};
+
+/* Step function for Path.pairs(): the state is the index of the segment last
+ * handed back, and each call returns (index, segment) so
+ * `for i, seg in cairo.Path.pairs(path)` reads like pairs() over an array. */
+static int
+path_pairs_next(lua_State *L)
+{
+    int i = (int)luaL_optinteger(L, 2, 0) + 1;
+
+    /* Push the index BEFORE looking up the segment: for iterates as
+     * `control, var1, var2 = f(state, control)`, so ret1 is both the new
+     * control and the first variable. Reversed it returned (segment, index),
+     * the second pass handed a table to luaL_optinteger and the loop died with
+     * "bad argument #2 to 'for iterator' (number expected, got table)" after
+     * exactly one segment. */
+    lua_pushinteger(L, i);
+    lua_rawgeti(L, 1, i);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 2);
+        return 0;
+    }
+    return 2;
+}
+
+/* An iterator over an array of PathData tables, returned in the same generator
+ * shape pairs() itself returns (f, state, control), so
+ * `for i, seg in cairo.Path.pairs(cr:copy_path())` loops exactly like pairs()
+ * over an array. Lives on the Path table the way Format.stride_for_width lives
+ * on Format -- Path is an enum table in this shim, not a class. */
+static int
+path_pairs(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_pushcfunction(L, path_pairs_next);
+    lua_pushvalue(L, 1);
+    lua_pushnil(L);
+    return 3;
+}
+
+/* Walk cairo_path_t the way cairo's own docs walk it: a header, then
+ * length-1 points, one table per segment. This is what gives PathData and
+ * Path.pairs real input -- cairo_copy_path() is the only way to get a path
+ * out of a context. Returns a PLAIN ARRAY, matching how every extents call in
+ * this file returns tables rather than objects. */
+static int ctx_copy_path(lua_State *L)
+{
+    cairo_path_t *p = cairo_copy_path(chk(L, 1));
+    int i = 0, n = p->num_data;
+
+    lua_newtable(L);
+    while (i < n) {
+        const cairo_path_data_t *d = &p->data[i];
+        int type = (int)d->header.type;
+        int length = d->header.length;
+
+        /* Never read past the array: a truncated path stops the walk instead
+         * of running off the end. */
+        if (length <= 0 || i + length > n)
+            break;
+
+        lua_newtable(L);
+        lua_pushinteger(L, type);   lua_setfield(L, -2, "type");
+        lua_pushinteger(L, length); lua_setfield(L, -2, "length");
+        if (length >= 2) {
+            lua_pushnumber(L, p->data[i + 1].point.x); lua_setfield(L, -2, "x1");
+            lua_pushnumber(L, p->data[i + 1].point.y); lua_setfield(L, -2, "y1");
+        }
+        if (length >= 3) {
+            lua_pushnumber(L, p->data[i + 2].point.x); lua_setfield(L, -2, "x2");
+            lua_pushnumber(L, p->data[i + 2].point.y); lua_setfield(L, -2, "y2");
+        }
+        if (length >= 4) {
+            lua_pushnumber(L, p->data[i + 3].point.x); lua_setfield(L, -2, "x3");
+            lua_pushnumber(L, p->data[i + 3].point.y); lua_setfield(L, -2, "y3");
+        }
+        lua_rawseti(L, -2, lua_rawlen(L, -2) + 1);
+        i += length;
+    }
+    cairo_path_destroy(p);
+    return 1;
+}
 
 /* ---- Region ------------------------------------------------------------ */
 
@@ -2525,6 +2932,46 @@ static const luaL_Reg REGION_PG[] = {
     { NULL, NULL },
 };
 
+/* cairo_region_get_rectangle_list() is absent from this build (see the note at
+ * the top), so it is composed from num_rectangles() + get_rectangle() -- the
+ * same two calls placement.lua already makes. Plain table in the shape of
+ * cairo_rectangle_list_t: {rectangles = {...}, num_rectangles = n}. */
+static int region_get_rectangle_list(lua_State *L)
+{
+    cairo_region_t *r = chk_region(L, 1);
+    int n = cairo_region_num_rectangles(r);
+    int i;
+
+    lua_newtable(L);
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        cairo_rectangle_int_t rect;
+        cairo_region_get_rectangle(r, i, &rect);
+        push_rectint(L, &rect);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "rectangles");
+    lua_pushinteger(L, n);
+    lua_setfield(L, -2, "num_rectangles");
+    return 1;
+}
+
+static int rectangle_list_new(lua_State *L)
+{
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_setfield(L, -2, "rectangles");
+    lua_pushinteger(L, 0);
+    lua_setfield(L, -2, "num_rectangles");
+    return 1;
+}
+
+static const luaL_Reg RECTANGLE_LIST_M[] = {
+    { "new", rectangle_list_new },
+    { "is_type_of", type_of_is_table },
+    { NULL, NULL },
+};
+
 static const luaL_Reg REGION_M[] = {
     { "new",                    region_new },
     { "create",                 region_new },
@@ -2543,7 +2990,8 @@ static const luaL_Reg REGION_M[] = {
     { "contains_rectangle",     region_contains_rectangle },
     { "is_empty",               region_is_empty },
     { "num_rectangles",         region_num_rectangles },
-    { "get_rectangle",          region_get_rectangle },
+    { "get_rectangle",      region_get_rectangle },
+    { "get_rectangle_list", region_get_rectangle_list },
     { "get_extents",            region_get_extents },
     { "equal",                  region_equal },
     { "status",                 region_status },
@@ -2582,6 +3030,101 @@ static const luaL_Reg FONTOPT_M[] = {
     { NULL, NULL },
 };
 
+/* ---- ScaledFont ------------------------------------------------------ */
+
+/* This build ships NO font-face constructors: neither
+ * cairo_toy_font_face_get_type() nor cairo_font_face_create_for_ft_face() is
+ * in /usr/lib/libcairo.a (checked with nm), so there is nothing to hand to
+ * cairo_scaled_font_create() from Lua. The class is still registered through
+ * class_setup(), so its metatable and registry entry exist: the methods
+ * dispatch, is_type_of() compares against the right metatable, and a
+ * constructor added later needs no plumbing work.
+ * cairo.ScaledFont{...} raises "attempt to call a nil value" -- there is no
+ * new() to call; add one when a font-face API becomes available. */
+
+static int scaled_font_extents(lua_State *L)
+{
+    cairo_font_extents_t fe;
+
+    cairo_scaled_font_extents(chk(L, 1), &fe);
+    return push_font_extents(L, &fe);
+}
+
+static int scaled_font_get_ctm(lua_State *L)
+{
+    cairo_matrix_t m;
+
+    cairo_scaled_font_get_ctm(chk(L, 1), &m);
+    return push_matrix(L, &m);
+}
+
+static int scaled_font_get_font_matrix(lua_State *L)
+{
+    cairo_matrix_t m;
+
+    cairo_scaled_font_get_font_matrix(chk(L, 1), &m);
+    return push_matrix(L, &m);
+}
+
+static int scaled_font_get_scale_matrix(lua_State *L)
+{
+    cairo_matrix_t m;
+
+    cairo_scaled_font_get_scale_matrix(chk(L, 1), &m);
+    return push_matrix(L, &m);
+}
+
+/* Pre-1.14 form: the second argument is an IN/OUT buffer, not an out-pointer,
+ * so the wrapper has to supply its own live object and hand it over as owned
+ * -- exactly the dance ctx_get_font_options() does for the same reason. */
+static int scaled_font_get_font_options(lua_State *L)
+{
+    cairo_font_options_t *fo = cairo_font_options_create();
+
+    cairo_scaled_font_get_font_options(chk(L, 1), fo);
+    return push_obj(L, fo, d_font_options, C_FONT_OPTIONS);
+}
+
+static const luaL_Reg SCALED_FONT_M[] = {
+    { "extents", scaled_font_extents },
+    { "get_ctm", scaled_font_get_ctm },
+    { "get_font_matrix", scaled_font_get_font_matrix },
+    { "get_font_options", scaled_font_get_font_options },
+    { "get_scale_matrix", scaled_font_get_scale_matrix },
+    { NULL, NULL },
+};
+
+/* ---- Module-level version accessors ---------------------------------- */
+
+/* cairo_version_encode() has no symbol in this build's libcairo.a and the
+ * header never declared it, so the documented encoding is computed here:
+ * major is the top 16 bits, minor the next 8, micro the low 8. */
+/* The three wrappers below are prefixed shim_ because cairo.h already declares
+ * cairo_version() and cairo_version_string() at file scope; an unprefixed local
+ * of the same name is a conflicting redeclaration, and the library call inside
+ * it would silently resolve to itself. */
+static int shim_cairo_version_encode(lua_State *L)
+{
+    int major = (int)luaL_optnumber(L, 1, 0);
+    int minor = (int)luaL_optnumber(L, 2, 0);
+    int micro = (int)luaL_optnumber(L, 3, 0);
+
+    lua_pushinteger(L, major * 65536 + minor * 256 + micro);
+    return 1;
+}
+
+static int shim_cairo_version(lua_State *L)
+{
+    lua_pushinteger(L, cairo_version());
+    return 1;
+}
+
+static int shim_cairo_version_string(lua_State *L)
+{
+    lua_pushstring(L, cairo_version_string());
+    return 1;
+}
+
 /* ---------------------------------------------------- module initialiser */
 
 int
@@ -2601,18 +3144,45 @@ luaopen_lgishim_cairo(lua_State *L)
     lua_setfield(L, -2, "RecordingSurface");
     class_setup(L, C_PATTERN,      PAT_M,     PAT_PG, PAT_P);
     lua_setfield(L, -2, "Pattern");
+    /* The gradient/solid family subclasses all reuse C_PATTERN's metatable, so
+     * cairo.Pattern:is_type_of() still passes for their instances -- see the
+     * note at the Pattern subtypes above. */
+    make_class_table(L, C_PATTERN, SOLID_PATTERN_M);
+    lua_setfield(L, -2, "SolidPattern");
+    make_class_table(L, C_PATTERN, GRADIENT_PATTERN_M);
+    lua_setfield(L, -2, "GradientPattern");
+    make_class_table(L, C_PATTERN, LINEAR_PATTERN_M);
+    lua_setfield(L, -2, "LinearPattern");
+    make_class_table(L, C_PATTERN, RADIAL_PATTERN_M);
+    lua_setfield(L, -2, "RadialPattern");
+    make_class_table(L, C_PATTERN, SURFACE_PATTERN_M);
+    lua_setfield(L, -2, "SurfacePattern");
+    make_class_table(L, C_PATTERN, MESH_PATTERN_M);
+    lua_setfield(L, -2, "MeshPattern");
     class_setup(L, C_FONT_OPTIONS, FONTOPT_M, NULL, NULL);
     lua_setfield(L, -2, "FontOptions");
     class_setup(L, C_MATRIX,       MATRIX_M,  MATRIX_PG, NULL);
     lua_setfield(L, -2, "Matrix");
     class_setup(L, C_REGION,       REGION_M,  REGION_PG, NULL);
     lua_setfield(L, -2, "Region");
-    /* Rectangle / RectangleInt are constructors for PLAIN TABLES, not
-     * userdata, so no metatable/registry entry -- just a __call table. */
+    class_setup(L, C_SCALED_FONT,  SCALED_FONT_M, NULL, NULL);
+    lua_setfield(L, -2, "ScaledFont");
+    /* Rectangle / RectangleInt, TextExtents / FontExtents, PathData and
+     * RectangleList are constructors for PLAIN TABLES, not userdata, so no
+     * metatable/registry entry -- just a __call table plus a manual is_type_of
+     * (type_of_is_table), because make_call_table() creates no metatable. */
     make_call_table(L, RECT_M);
     lua_setfield(L, -2, "Rectangle");
     make_call_table(L, RECT_M);
     lua_setfield(L, -2, "RectangleInt");
+    make_call_table(L, TEXT_EXTENTS_M);
+    lua_setfield(L, -2, "TextExtents");
+    make_call_table(L, FONT_EXTENTS_M);
+    lua_setfield(L, -2, "FontExtents");
+    make_call_table(L, PATH_DATA_M);
+    lua_setfield(L, -2, "PathData");
+    make_call_table(L, RECTANGLE_LIST_M);
+    lua_setfield(L, -2, "RectangleList");
 
     install_enum(L, "Operator",   OPERATOR,  sizeof(OPERATOR)  / sizeof(OPERATOR[0]));
     install_enum(L, "Format",     FORMAT,    sizeof(FORMAT)    / sizeof(FORMAT[0]));
@@ -2631,12 +3201,49 @@ luaopen_lgishim_cairo(lua_State *L)
     install_enum(L, "SurfaceType", SURFACETYPE, sizeof(SURFACETYPE) / sizeof(SURFACETYPE[0]));
     install_enum(L, "Overlap",  OVERLAP,   sizeof(OVERLAP)   / sizeof(OVERLAP[0]));
 
+    /* Number-valued families: the C constants, not their spellings -- callers
+     * compare them arithmetically (cairo.FontType.FT == 0). */
+    install_enum_num(L, "FontType",      FONT_TYPE,      sizeof(FONT_TYPE)      / sizeof(FONT_TYPE[0]));
+    install_enum_num(L, "DeviceType",    DEVICE_TYPE,    sizeof(DEVICE_TYPE)    / sizeof(DEVICE_TYPE[0]));
+    install_enum_num(L, "SubpixelOrder", SUBPIXEL_ORDER, sizeof(SUBPIXEL_ORDER) / sizeof(SUBPIXEL_ORDER[0]));
+    install_enum_num(L, "HintMetrics",   HINT_METRICS,   sizeof(HINT_METRICS)   / sizeof(HINT_METRICS[0]));
+    install_enum_num(L, "HintStyle",     HINT_STYLE,     sizeof(HINT_STYLE)     / sizeof(HINT_STYLE[0]));
+    install_enum_num(L, "RegionOverlap", REGION_OVERLAP, sizeof(REGION_OVERLAP) / sizeof(REGION_OVERLAP[0]));
+    install_enum_num(L, "PdfVersion",    PDF_VERSION,    sizeof(PDF_VERSION)    / sizeof(PDF_VERSION[0]));
+    install_enum_num(L, "PsLevel",       PS_LEVEL,       sizeof(PS_LEVEL)       / sizeof(PS_LEVEL[0]));
+    install_enum_num(L, "SvgVersion",    SVG_VERSION,    sizeof(SVG_VERSION)    / sizeof(SVG_VERSION[0]));
+    install_enum_num(L, "PathDataType",  PATH_DATA_TYPE, sizeof(PATH_DATA_TYPE) / sizeof(PATH_DATA_TYPE[0]));
+
     /* Format is an enum table, but lib/ also calls a function on it
      * (naughty/dbus.lua:94), so attach the helper after install_enum(). */
     lua_getfield(L, -1, "Format");
     lua_pushcfunction(L, format_stride_for_width);
     lua_setfield(L, -2, "stride_for_width");
     lua_pop(L, 1);
+
+    /* Path is an enum table too, and the path iterator has nowhere else to go.
+     * It walks the array cr:copy_path() returns, in pairs() shape. */
+    lua_getfield(L, -1, "Path");
+    lua_pushcfunction(L, path_pairs);
+    lua_setfield(L, -2, "pairs");
+    lua_pop(L, 1);
+
+    /* lgi puts the version queries on the namespace itself, so they go on the
+     * module table next to the classes. _module is lgi's introspected Namespace
+     * object; with no introspection here the shim hands back the same identity
+     * information as a plain table, and version is the RUNTIME string rather
+     * than the GIR's fixed one, so the shim cannot lie about the build. */
+    lua_pushcfunction(L, shim_cairo_version);
+    lua_setfield(L, -2, "version");
+    lua_pushcfunction(L, shim_cairo_version_string);
+    lua_setfield(L, -2, "version_string");
+    lua_pushcfunction(L, shim_cairo_version_encode);
+    lua_setfield(L, -2, "version_encode");
+    lua_newtable(L);
+    lua_pushstring(L, "cairo");          lua_setfield(L, -2, "name");
+    lua_pushstring(L, "cairo");          lua_setfield(L, -2, "prefix");
+    lua_pushstring(L, cairo_version_string()); lua_setfield(L, -2, "version");
+    lua_setfield(L, -2, "_module");
 
     return 1;
 }

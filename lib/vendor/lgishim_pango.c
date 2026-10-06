@@ -18,7 +18,13 @@
  *     pango_cairo_font_map_set_resolution() + pango_context_changed();
  *   - enums travel as UPPERCASE variant names ("LEFT", "WORD_CHAR", ...)
  *     because wibox/widget/textbox.lua compares the getter result against the
- *     same strings it passes to the setter.
+ *     same strings it passes to the setter. Weight/Style/Stretch/Underline/
+ *     Variant/Gravity/GravityHint are the exception and are installed as their
+ *     real numeric values, because Awesome and theme code compares them
+ *     arithmetically (beautiful: weight > Pango.Weight.BOLD).
+ *   - pango_attr_list_insert()/insert_before()/change() on 1.48 store the
+ *     attribute pointer without ref'ing it, and change() destroys it outright
+ *     when the range is empty, so the shim inserts a copy.
  *
  * Layout measurement API (get_extents/get_size/get_baseline/get_line_count)
  * added in Phase 2 Part 7. get_extents is the Pango-units counterpart of
@@ -54,6 +60,8 @@ enum {
     C_FONTMAP,
     C_CONTEXT,
     C_METRICS,
+    C_ATTRIBUTE,
+    C_TABARRAY,
     N_CLASSES
 };
 
@@ -66,6 +74,8 @@ static const char *CLS_NAMES[N_CLASSES] = {
     "lgishim_pango.FontMap",
     "lgishim_pango.Context",
     "lgishim_pango.FontMetrics",
+    "lgishim_pango.Attribute",
+    "lgishim_pango.TabArray",
 };
 
 /* Both this module and lgishim_cairo.c must own their own metatable names and
@@ -102,6 +112,18 @@ static void d_gfree(void *p)
 static void d_attrlist(void *p)
 {
     pango_attr_list_unref((PangoAttrList *)p);
+}
+
+/* pango_attribute_destroy() is the only way out: PangoAttribute is not a
+ * GBoxed and has no pango_attribute_free/unref variant. */
+static void d_attribute(void *p)
+{
+    pango_attribute_destroy((PangoAttribute *)p);
+}
+
+static void d_tabarray(void *p)
+{
+    pango_tab_array_free((PangoTabArray *)p);
 }
 
 /* PangoFontDescription and PangoFontMetrics are GBoxed (independent
@@ -142,6 +164,20 @@ chk(lua_State *L, int idx)
     if (!w)
         luaL_error(L, "lgishim: expected object at arg %d, got %s",
                    idx, lua_isnil(L, idx) ? "nil" : luaL_typename(L, idx));
+    return w->p;
+}
+
+/* chk() only proves the argument is a userdata, so two different object kinds
+ * can be cast into each other silently -- an AttrList passed where an
+ * Attribute is expected dereferences pango_attr_list's internals as an
+ * attribute and corrupts memory. chk_cls() adds the class check. */
+static void *
+chk_cls(lua_State *L, int idx, int cls)
+{
+    wrap *w = getud(L, idx);
+    if (!w || w->cls != cls)
+        luaL_error(L, "lgishim: expected %s at arg %d, got %s",
+                   CLS_NAMES[cls], idx, lua_typename(L, idx));
     return w->p;
 }
 
@@ -240,6 +276,26 @@ enum_to(lua_State *L, const struct enumpair *t, size_t n, int v)
     return 1;
 }
 
+/* Numeric counterpart of enum_from(): the Weight/Style/Stretch/Underline/
+ * Variant/Gravity/GravityHint tables are installed with integer values, so
+ * their setters have to accept numbers as well as names. A missing argument
+ * still means "use the default", exactly as enum_from() does. */
+static int
+enum_num_from(lua_State *L, int idx, const struct enumpair *t, size_t n,
+              int defv)
+{
+    size_t i;
+    if (lua_isnoneornil(L, idx))
+        return defv;
+    if (lua_isnumber(L, idx))
+        return (int)luaL_checkinteger(L, idx);
+    for (i = 0; i < n; i++)
+        if (!strcmp(luaL_checkstring(L, idx), t[i].name))
+            return t[i].value;
+    return luaL_error(L, "lgishim.Pango: unknown enum value %q",
+                      (const char *)lua_tostring(L, idx));
+}
+
 static const struct enumpair ALIGN[] = {
     { "LEFT", PANGO_ALIGN_LEFT },
     { "CENTER", PANGO_ALIGN_CENTER },
@@ -258,6 +314,96 @@ static const struct enumpair WrAP[] = {
     { "CHAR", PANGO_WRAP_CHAR },
     { "WORD_CHAR", PANGO_WRAP_WORD_CHAR },
 };
+
+/* Numeric enum tables. install_enum_num() publishes the real integer values,
+ * which is what lgi's introspected enums look like from Lua; the pa_* and l_*
+ * setters go through enum_num_from() and take either spelling.
+ *
+ * Values are read from the 1.48.10 headers, never hard-coded -- BOOK is 380,
+ * which is what a stale "400" assumption would get wrong. */
+static const struct enumpair WEIGHT[] = {
+    { "THIN", PANGO_WEIGHT_THIN },
+    { "ULTRALIGHT", PANGO_WEIGHT_ULTRALIGHT },
+    { "LIGHT", PANGO_WEIGHT_LIGHT },
+    { "SEMILIGHT", PANGO_WEIGHT_SEMILIGHT },
+    { "BOOK", PANGO_WEIGHT_BOOK },
+    { "NORMAL", PANGO_WEIGHT_NORMAL },
+    { "MEDIUM", PANGO_WEIGHT_MEDIUM },
+    { "SEMIBOLD", PANGO_WEIGHT_SEMIBOLD },
+    { "BOLD", PANGO_WEIGHT_BOLD },
+    { "ULTRABOLD", PANGO_WEIGHT_ULTRABOLD },
+    { "HEAVY", PANGO_WEIGHT_HEAVY },
+    { "ULTRAHEAVY", PANGO_WEIGHT_ULTRAHEAVY },
+};
+
+static const struct enumpair STYLE[] = {
+    { "NORMAL", PANGO_STYLE_NORMAL },
+    { "ITALIC", PANGO_STYLE_ITALIC },
+    { "OBLIQUE", PANGO_STYLE_OBLIQUE },
+};
+
+static const struct enumpair STRETCH[] = {
+    { "ULTRA_CONDENSED", PANGO_STRETCH_ULTRA_CONDENSED },
+    { "EXTRA_CONDENSED", PANGO_STRETCH_EXTRA_CONDENSED },
+    { "CONDENSED", PANGO_STRETCH_CONDENSED },
+    { "SEMI_CONDENSED", PANGO_STRETCH_SEMI_CONDENSED },
+    { "NORMAL", PANGO_STRETCH_NORMAL },
+    { "SEMI_EXPANDED", PANGO_STRETCH_SEMI_EXPANDED },
+    { "EXPANDED", PANGO_STRETCH_EXPANDED },
+    { "EXTRA_EXPANDED", PANGO_STRETCH_EXTRA_EXPANDED },
+    { "ULTRA_EXPANDED", PANGO_STRETCH_ULTRA_EXPANDED },
+};
+
+static const struct enumpair UNDERLINE[] = {
+    { "NONE", PANGO_UNDERLINE_NONE },
+    { "SINGLE", PANGO_UNDERLINE_SINGLE },
+    { "DOUBLE", PANGO_UNDERLINE_DOUBLE },
+    { "LOW", PANGO_UNDERLINE_LOW },
+    { "ERROR", PANGO_UNDERLINE_ERROR },
+    { "ERROR_LINE", PANGO_UNDERLINE_ERROR_LINE },
+    { "SINGLE_LINE", PANGO_UNDERLINE_SINGLE_LINE },
+    { "DOUBLE_LINE", PANGO_UNDERLINE_DOUBLE_LINE },
+};
+
+/* 1.48 has no PETITE_CAPS/TITLE_CAPS/UNICASE member; adding them would mean
+ * inventing values that pango itself does not understand. */
+static const struct enumpair VARIANT[] = {
+    { "NORMAL", PANGO_VARIANT_NORMAL },
+    { "SMALL_CAPS", PANGO_VARIANT_SMALL_CAPS },
+};
+
+static const struct enumpair GRAVITY[] = {
+    { "NORTH", PANGO_GRAVITY_NORTH },
+    { "WEST", PANGO_GRAVITY_WEST },
+    { "SOUTH", PANGO_GRAVITY_SOUTH },
+    { "EAST", PANGO_GRAVITY_EAST },
+    { "AUTO", PANGO_GRAVITY_AUTO },
+};
+
+static const struct enumpair GRAVITYHINT[] = {
+    { "NATURAL", PANGO_GRAVITY_HINT_NATURAL },
+    { "LINE", PANGO_GRAVITY_HINT_LINE },
+    { "STRONG", PANGO_GRAVITY_HINT_STRONG },
+};
+
+/* Install one enum table on the module, which must sit at stack slot -1 at
+ * call time. Values are pushed as integers -- that is how lgi's introspected
+ * enum types cross into Lua, and it is what makes arithmetic comparisons work.
+ * The ALIGN/ELLIPSIZE/WrAP tables above stay out of this: they only feed
+ * enum_from()/enum_to() and are string-valued by design, so no string-flavoured
+ * install_enum() is needed here. Leaves the module table on top. */
+static void
+install_enum_num(lua_State *L, const char *fieldname,
+                 const struct enumpair *t, size_t n)
+{
+    size_t i;
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        lua_pushinteger(L, t[i].value);
+        lua_setfield(L, -2, t[i].name);
+    }
+    lua_setfield(L, -2, fieldname);
+}
 
 /* ------------------------------------------------------------ Layout */
 
@@ -461,6 +607,211 @@ static int l_get_line_count(lua_State *L)
     return 1;
 }
 
+/*
+ * Inter-line spacing in Pango units. lib/awful/widget/layoutlist.lua:344
+ * calls layout:set_spacing() straight off the object, which died with
+ * "attempt to call a nil value" while this was missing.
+ *
+ * 1.48's setter takes a double but the getter returns an int, so a fractional
+ * value is stored and then truncated on read-back -- pass luaL_checknumber, not
+ * luaL_checkinteger, or callers passing e.g. 3.5 die with "number has no
+ * integer representation". The int cast would have silently truncated too.
+ */
+ static int l_set_spacing(lua_State *L)
+ {
+    pango_layout_set_spacing(chk(L, 1), luaL_checknumber(L, 2));
+    return 0;
+ }
+
+static int l_get_spacing(lua_State *L)
+{
+    lua_pushinteger(L, pango_layout_get_spacing(chk(L, 1)));
+    return 1;
+}
+
+/*
+ * 1.48's pango_layout_set_markup() takes no GError: on a parse failure
+ * pango_layout_set_markup_with_accel() g_warning()s and returns with the
+ * layout's text and attributes left exactly as they were, so this can never
+ * raise and can never leave a half-set layout. Callers that need a fallible
+ * result use Pango.parse_markup() plus set_text()/set_attributes() -- the
+ * path textbox:set_markup_silently() already takes.
+ */
+static int l_set_markup(lua_State *L)
+{
+    size_t len = 0;
+    pango_layout_set_markup(chk(L, 1), luaL_checklstring(L, 2, &len),
+                            (int)len);
+    return 0;
+}
+
+static int l_set_auto_dir(lua_State *L)
+{
+    pango_layout_set_auto_dir(chk(L, 1), lua_toboolean(L, 2));
+    return 0;
+}
+
+/* pango_layout_get_auto_dir() exists in 1.48 (PANGO_AVAILABLE_IN_1_4), so no
+ * guard is needed here. */
+static int l_get_auto_dir(lua_State *L)
+{
+    lua_pushboolean(L, pango_layout_get_auto_dir(chk(L, 1)));
+    return 1;
+}
+
+static int l_set_single_paragraph_mode(lua_State *L)
+{
+    pango_layout_set_single_paragraph_mode(chk(L, 1), lua_toboolean(L, 2));
+    return 0;
+}
+
+static int l_get_single_paragraph_mode(lua_State *L)
+{
+    lua_pushboolean(L, pango_layout_get_single_paragraph_mode(chk(L, 1)));
+    return 1;
+}
+
+static int l_set_tabs(lua_State *L)
+{
+    wrap *w = getud(L, 2);
+    if (w && w->cls != C_TABARRAY)
+        luaL_error(L, "lgishim.Pango: expected Pango.TabArray or nil, got %s",
+                   lua_typename(L, 2));
+    pango_layout_set_tabs(chk(L, 1), w ? w->p : NULL);
+    return 0;
+}
+
+static int l_get_tabs(lua_State *L)
+{
+    PangoTabArray *tabs = pango_layout_get_tabs(chk(L, 1));
+    if (!tabs) {
+        lua_pushnil(L);
+        return 1;
+    }
+    /* Borrowed: the layout owns the tab array, so the wrapper must not free
+     * it -- the same treatment as get_attributes(). */
+    return push_obj(L, tabs, d_noop, C_TABARRAY);
+}
+
+/*
+ * pango_layout_get_log_attrs() is out-param style, so the array has to be
+ * g_free()d by us. The PangoLogAttr records themselves are scratch storage
+ * for the layout, so each one is copied into a plain table rather than being
+ * handed out as a pointer.
+ */
+static int l_get_log_attrs(lua_State *L)
+{
+    PangoLogAttr *attrs = NULL;
+    int n = 0, i;
+
+    pango_layout_get_log_attrs(chk(L, 1), &attrs, &n);
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        const PangoLogAttr *a = &attrs[i];
+        lua_newtable(L);
+        lua_pushboolean(L, a->is_line_break);
+        lua_setfield(L, -2, "is_line_break");
+        lua_pushboolean(L, a->is_mandatory_break);
+        lua_setfield(L, -2, "is_mandatory_break");
+        lua_pushboolean(L, a->is_char_break);
+        lua_setfield(L, -2, "is_char_break");
+        lua_pushboolean(L, a->is_white);
+        lua_setfield(L, -2, "is_white");
+        lua_pushboolean(L, a->is_cursor_position);
+        lua_setfield(L, -2, "is_cursor_position");
+        lua_pushboolean(L, a->is_word_start);
+        lua_setfield(L, -2, "is_word_start");
+        lua_pushboolean(L, a->is_word_end);
+        lua_setfield(L, -2, "is_word_end");
+        lua_pushboolean(L, a->is_sentence_boundary);
+        lua_setfield(L, -2, "is_sentence_boundary");
+        lua_pushboolean(L, a->is_sentence_start);
+        lua_setfield(L, -2, "is_sentence_start");
+        lua_pushboolean(L, a->is_sentence_end);
+        lua_setfield(L, -2, "is_sentence_end");
+        lua_pushboolean(L, a->backspace_deletes_character);
+        lua_setfield(L, -2, "backspace_deletes_character");
+        lua_pushboolean(L, a->is_expandable_space);
+        lua_setfield(L, -2, "is_expandable_space");
+        lua_pushboolean(L, a->is_word_boundary);
+        lua_setfield(L, -2, "is_word_boundary");
+        lua_rawseti(L, -2, i + 1);
+    }
+    if (attrs)
+        g_free(attrs);
+    return 1;
+}
+
+/*
+ * PangoLayoutLine is a public struct here, so the fields can be read
+ * directly. The structs are internal to the layout and invalidated by the
+ * next layout pass, which is why each line is copied into a table instead of
+ * returning a wrapper -- the same reason log attrs above are copied. `runs`
+ * is a GSList of PangoGlyphItem and is deliberately not exported.
+ */
+static int l_get_lines(lua_State *L)
+{
+    GSList *lines = pango_layout_get_lines(chk(L, 1));
+    GSList *it;
+    int i = 1;
+
+    lua_newtable(L);
+    for (it = lines; it; it = it->next, i++) {
+        PangoLayoutLine *line = (PangoLayoutLine *)it->data;
+        lua_newtable(L);
+        lua_pushinteger(L, line->start_index);
+        lua_setfield(L, -2, "start_index");
+        lua_pushinteger(L, line->length);
+        lua_setfield(L, -2, "length");
+        lua_pushboolean(L, line->is_paragraph_start);
+        lua_setfield(L, -2, "is_paragraph_start");
+        lua_pushinteger(L, line->resolved_dir);
+        lua_setfield(L, -2, "resolved_dir");
+        lua_rawseti(L, -2, i);
+    }
+    return 1;
+}
+
+static int l_get_character_count(lua_State *L)
+{
+    lua_pushinteger(L, pango_layout_get_character_count(chk(L, 1)));
+    return 1;
+}
+
+static int l_get_font_description(lua_State *L)
+{
+    const PangoFontDescription *d = pango_layout_get_font_description(chk(L, 1));
+    if (!d) {
+        lua_pushnil(L);
+        return 1;
+    }
+    /* Borrowed: the layout owns the description. */
+    return push_obj(L, (void *)d, d_noop, C_FONTDESC);
+}
+
+static int l_get_context(lua_State *L)
+{
+    PangoContext *c = pango_layout_get_context(chk(L, 1));
+    if (!c) {
+        lua_pushnil(L);
+        return 1;
+    }
+    /* Borrowed: the layout owns its context, so d_noop leaks nothing. */
+    return push_obj(L, c, d_noop, C_CONTEXT);
+}
+
+static int l_is_ellipsized(lua_State *L)
+{
+    lua_pushboolean(L, pango_layout_is_ellipsized(chk(L, 1)));
+    return 1;
+}
+
+static int l_is_wrapped(lua_State *L)
+{
+    lua_pushboolean(L, pango_layout_is_wrapped(chk(L, 1)));
+    return 1;
+}
+
 static int l_context_changed(lua_State *L)
 {
     pango_layout_context_changed(chk(L, 1));
@@ -480,6 +831,11 @@ static const luaL_Reg LAYOUT_M[] = {
     { "set_alignment", l_set_alignment },
     { "set_line_spacing", l_set_line_spacing },
     { "set_font_description", l_set_font_description },
+    { "set_markup", l_set_markup },
+    { "set_spacing", l_set_spacing },
+    { "set_auto_dir", l_set_auto_dir },
+    { "set_single_paragraph_mode", l_set_single_paragraph_mode },
+    { "set_tabs", l_set_tabs },
     { "get_text", l_get_text },
     { "get_attributes", l_get_attributes },
     { "get_width", l_get_width },
@@ -490,6 +846,17 @@ static const luaL_Reg LAYOUT_M[] = {
     { "get_justify", l_get_justify },
     { "get_alignment", l_get_alignment },
     { "get_line_spacing", l_get_line_spacing },
+    { "get_spacing", l_get_spacing },
+    { "get_auto_dir", l_get_auto_dir },
+    { "get_single_paragraph_mode", l_get_single_paragraph_mode },
+    { "get_tabs", l_get_tabs },
+    { "get_lines", l_get_lines },
+    { "get_log_attrs", l_get_log_attrs },
+    { "get_character_count", l_get_character_count },
+    { "get_font_description", l_get_font_description },
+    { "get_context", l_get_context },
+    { "is_ellipsized", l_is_ellipsized },
+    { "is_wrapped", l_is_wrapped },
     { "get_pixel_extents", l_get_pixel_extents },
     { "get_extents", l_get_extents },
     { "get_size", l_get_size },
@@ -504,6 +871,11 @@ static const luaL_Reg LAYOUT_P[] = {
     { "attributes", l_set_attributes },
     { "width", l_set_width },
     { "height", l_set_height },
+    { "markup", l_set_markup },
+    { "spacing", l_set_spacing },
+    { "auto_dir", l_set_auto_dir },
+    { "single_paragraph_mode", l_set_single_paragraph_mode },
+    { "tabs", l_set_tabs },
     { NULL, NULL },
 };
 
@@ -518,6 +890,10 @@ static const luaL_Reg LAYOUT_PG[] = {
     { "attributes", l_get_attributes },
     { "width", l_get_width },
     { "height", l_get_height },
+    { "spacing", l_get_spacing },
+    { "auto_dir", l_get_auto_dir },
+    { "single_paragraph_mode", l_get_single_paragraph_mode },
+    { "tabs", l_get_tabs },
     { NULL, NULL },
 };
 
@@ -734,8 +1110,424 @@ static int al_new(lua_State *L)
     return push_obj(L, pango_attr_list_new(), d_attrlist, C_ATTRLIST);
 }
 
+/*
+ * 1.48's insert()/insert_before()/change() take the attribute exactly as they
+ * are given it: they store the pointer in the list's GPtrArray without ref'ing
+ * it, and change() calls pango_attribute_destroy() on it whenever the range is
+ * empty or it merges into an attribute that already covers the same span.
+ * Handing over our own pointer would leave the list pointing at something a
+ * later collect() frees -- or at something the list already destroyed. Copying
+ * first is what keeps both reference counts balanced: the list owns its copy,
+ * the Attribute userdata keeps its own, so neither leaks and neither
+ * double-frees.
+ *
+ * 1.50 widens these signatures with a `before` parameter on insert_before()
+ * and an `old_attr` on change(); neither exists in 1.48, so both take a single
+ * argument here.
+ */
+static int al_insert(lua_State *L)
+{
+    pango_attr_list_insert(
+        (PangoAttrList *)chk_cls(L, 1, C_ATTRLIST),
+        pango_attribute_copy((PangoAttribute *)chk_cls(L, 2, C_ATTRIBUTE)));
+    return 0;
+}
+
+static int al_insert_before(lua_State *L)
+{
+    pango_attr_list_insert_before(
+        (PangoAttrList *)chk_cls(L, 1, C_ATTRLIST),
+        pango_attribute_copy((PangoAttribute *)chk_cls(L, 2, C_ATTRIBUTE)));
+    return 0;
+}
+
+static int al_change(lua_State *L)
+{
+    pango_attr_list_change(
+        (PangoAttrList *)chk_cls(L, 1, C_ATTRLIST),
+        pango_attribute_copy((PangoAttribute *)chk_cls(L, 2, C_ATTRIBUTE)));
+    return 0;
+}
+
 static const luaL_Reg ATTRLIST_M[] = {
     { "new", al_new },
+    { "insert", al_insert },
+    { "insert_before", al_insert_before },
+    { "change", al_change },
+    { NULL, NULL },
+};
+
+/* ---------------------------------------------------------- TabArray */
+
+static int ta_new(lua_State *L)
+{
+    return push_obj(L, pango_tab_array_new(
+                    (gint)luaL_optinteger(L, 1, 0),
+                    lua_toboolean(L, 2)),
+                    d_tabarray, C_TABARRAY);
+}
+
+/* Returns (alignment, location). Out-of-range indexes make pango return
+ * without writing either out parameter, so both are zeroed first. */
+static int ta_get_tab(lua_State *L)
+{
+    PangoTabAlign align = PANGO_TAB_LEFT;
+    gint location = 0;
+
+    pango_tab_array_get_tab((PangoTabArray *)chk_cls(L, 1, C_TABARRAY),
+                            (gint)luaL_checkinteger(L, 2),
+                            &align, &location);
+    lua_pushinteger(L, align);
+    lua_pushinteger(L, location);
+    return 2;
+}
+
+static int ta_get_size(lua_State *L)
+{
+    lua_pushinteger(L, pango_tab_array_get_size(
+                          (PangoTabArray *)chk_cls(L, 1, C_TABARRAY)));
+    return 1;
+}
+
+static const luaL_Reg TABARRAY_M[] = {
+    { "new", ta_new },
+    { "get_tab", ta_get_tab },
+    { "get_size", ta_get_size },
+    { NULL, NULL },
+};
+
+/* --------------------------------------------------------- Rectangle */
+
+/*
+ * PangoRectangle is a plain C struct with no GObject type, so there is no
+ * userdata to manage. new() returns the same {x,y,width,height} table shape
+ * that push_rect() emits from get_extents()/get_pixel_extents(), which makes
+ * the two interchangeable -- a rectangle read back off a layout can be fed
+ * straight to shape_new() without any conversion.
+ */
+static int rc_new(lua_State *L)
+{
+    PangoRectangle r;
+
+    r.x = (int)luaL_optinteger(L, 1, 0);
+    r.y = (int)luaL_optinteger(L, 2, 0);
+    r.width = (int)luaL_optinteger(L, 3, 0);
+    r.height = (int)luaL_optinteger(L, 4, 0);
+    push_rect(L, &r);
+    return 1;
+}
+
+/*
+ * Read a rectangle out of a plain table (from Rectangle.new() or from
+ * get_extents()). 0 means the argument was absent, in which case the caller
+ * pushes nil for the parameter. Field access goes through the absolute
+ * argument index so the pushed values never shift it.
+ */
+static int
+rect_arg(lua_State *L, int idx, PangoRectangle *out)
+{
+    int len = lua_gettop(L);
+
+    luaL_checkstack(L, 6, NULL);
+    if (!lua_istable(L, idx))
+        return 0;
+    lua_getfield(L, idx, "x");
+    out->x = (int)luaL_optinteger(L, -1, 0);
+    lua_getfield(L, idx, "y");
+    out->y = (int)luaL_optinteger(L, -1, 0);
+    lua_getfield(L, idx, "width");
+    out->width = (int)luaL_optinteger(L, -1, 0);
+    lua_getfield(L, idx, "height");
+    out->height = (int)luaL_optinteger(L, -1, 0);
+    lua_settop(L, len);
+    return 1;
+}
+
+/*
+ * A colour argument is either a Pango.Color userdata (from Color.new() /
+ * Color.parse()) or a spec string such as "#ff8800". Returning 0 means "no
+ * colour given", in which case the caller pushes nil for the parameter.
+ * On 1.48 PangoColor is a public struct, so the components are read directly
+ * -- the same access path Color's own getters use.
+ */
+static int
+color_arg(lua_State *L, int idx, guint16 *r, guint16 *g, guint16 *b)
+{
+    wrap *w = getud(L, idx);
+
+    if (w) {
+        if (w->cls != C_COLOR)
+            luaL_error(L, "lgishim.Pango: expected Pango.Color or a colour "
+                           "string, got %s", lua_typename(L, idx));
+        *r = ((PangoColor *)w->p)->red;
+        *g = ((PangoColor *)w->p)->green;
+        *b = ((PangoColor *)w->p)->blue;
+        return 1;
+    }
+    if (lua_isstring(L, idx)) {
+        PangoColor c;
+        if (!pango_color_parse(&c, luaL_checkstring(L, idx)))
+            luaL_error(L, "lgishim.Pango: cannot parse colour %q",
+                       luaL_checkstring(L, idx));
+        *r = c.red;
+        *g = c.green;
+        *b = c.blue;
+        return 1;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------- Attribute */
+
+static int pa_new_attr(lua_State *L, PangoAttribute *a)
+{
+    return push_obj(L, a, d_attribute, C_ATTRIBUTE);
+}
+
+static int pa_size_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_size_new(
+                            (int)luaL_checkinteger(L, 1)));
+}
+
+static int pa_size_new_absolute(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_size_new_absolute(
+                                    (int)luaL_checkinteger(L, 1)));
+}
+
+static int pa_weight_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_weight_new(
+                            (PangoWeight)enum_num_from(L, 1, WEIGHT,
+                                sizeof(WEIGHT) / sizeof(WEIGHT[0]),
+                                PANGO_WEIGHT_NORMAL)));
+}
+
+static int pa_style_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_style_new(
+                            (PangoStyle)enum_num_from(L, 1, STYLE,
+                                sizeof(STYLE) / sizeof(STYLE[0]),
+                                PANGO_STYLE_NORMAL)));
+}
+
+static int pa_family_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_family_new(
+                            luaL_checkstring(L, 1)));
+}
+
+static int pa_underline_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_underline_new(
+                                (PangoUnderline)enum_num_from(L, 1, UNDERLINE,
+                                    sizeof(UNDERLINE) / sizeof(UNDERLINE[0]),
+                                    PANGO_UNDERLINE_NONE)));
+}
+
+static int pa_strikethrough_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_strikethrough_new(
+                                    lua_toboolean(L, 1)));
+}
+
+static int pa_foreground_new(lua_State *L)
+{
+    guint16 r, g, b;
+
+    if (!color_arg(L, 1, &r, &g, &b))
+        luaL_error(L, "lgishim.Pango.Attribute:foreground_new: missing colour");
+    return pa_new_attr(L, pango_attr_foreground_new(r, g, b));
+}
+
+static int pa_background_new(lua_State *L)
+{
+    guint16 r, g, b;
+
+    if (!color_arg(L, 1, &r, &g, &b))
+        luaL_error(L, "lgishim.Pango.Attribute:background_new: missing colour");
+    return pa_new_attr(L, pango_attr_background_new(r, g, b));
+}
+
+static int pa_letter_spacing_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_letter_spacing_new(
+                                    (int)luaL_checkinteger(L, 1)));
+}
+
+static int pa_rise_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_rise_new(
+                            (int)luaL_checkinteger(L, 1)));
+}
+
+static int pa_scale_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_scale_new(
+                            luaL_checknumber(L, 1)));
+}
+
+/* lgi calls this font_desc_new(); desc_new is the short spelling and both are
+ * wired up in ATTRIBUTE_M. */
+static int pa_font_desc_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_font_desc_new(
+                                (const PangoFontDescription *)chk_cls(L, 1,
+                                                                     C_FONTDESC)));
+}
+
+static int pa_variant_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_variant_new(
+                                (PangoVariant)enum_num_from(L, 1, VARIANT,
+                                    sizeof(VARIANT) / sizeof(VARIANT[0]),
+                                    PANGO_VARIANT_NORMAL)));
+}
+
+static int pa_gravity_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_gravity_new(
+                               (PangoGravity)enum_num_from(L, 1, GRAVITY,
+                                   sizeof(GRAVITY) / sizeof(GRAVITY[0]),
+                                   PANGO_GRAVITY_SOUTH)));
+}
+
+static int pa_gravity_hint_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_gravity_hint_new(
+                                    (PangoGravityHint)enum_num_from(
+                                        L, 1, GRAVITYHINT,
+                                        sizeof(GRAVITYHINT) /
+                                            sizeof(GRAVITYHINT[0]),
+                                        PANGO_GRAVITY_HINT_NATURAL)));
+}
+
+static int pa_shape_new(lua_State *L)
+{
+    PangoRectangle ink, logical;
+
+    if (!rect_arg(L, 1, &ink) || !rect_arg(L, 2, &logical)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return pa_new_attr(L, pango_attr_shape_new(&ink, &logical));
+}
+
+static int pa_fallback_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_fallback_new(
+                                lua_toboolean(L, 1)));
+}
+
+static int pa_underline_color_new(lua_State *L)
+{
+    guint16 r, g, b;
+
+    if (!color_arg(L, 1, &r, &g, &b)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return pa_new_attr(L, pango_attr_underline_color_new(r, g, b));
+}
+
+static int pa_strikethrough_color_new(lua_State *L)
+{
+    guint16 r, g, b;
+
+    if (!color_arg(L, 1, &r, &g, &b)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return pa_new_attr(L, pango_attr_strikethrough_color_new(r, g, b));
+}
+
+/*
+ * pango_language_from_string() returns a shared entry out of pango's language
+ * tables and there is no pango_language_free(), so the wrapper must not release
+ * it either. pango_attr_language_new() refs the language itself and
+ * pango_attribute_destroy() puts that ref back, which is balanced.
+ */
+static int pa_language_new(lua_State *L)
+{
+    return pa_new_attr(L, pango_attr_language_new(
+                                pango_language_from_string(
+                                    luaL_checkstring(L, 1))));
+}
+
+/*
+ * PangoAttribute on 1.48 only exposes start_index and end_index; type and
+ * flags live on the (private) attribute class, so they are not addressable and
+ * are not exported. Both fields are writable, which is what change()-style
+ * range tweaks need.
+ */
+static int pa_get_start_index(lua_State *L)
+{
+    PangoAttribute *a = chk_cls(L, 1, C_ATTRIBUTE);
+
+    lua_pushinteger(L, a->start_index);
+    return 1;
+}
+
+static int pa_set_start_index(lua_State *L)
+{
+    ((PangoAttribute *)chk_cls(L, 1, C_ATTRIBUTE))->start_index =
+        (guint)luaL_checkinteger(L, 2);
+    return 0;
+}
+
+static int pa_get_end_index(lua_State *L)
+{
+    PangoAttribute *a = chk_cls(L, 1, C_ATTRIBUTE);
+
+    lua_pushinteger(L, a->end_index);
+    return 1;
+}
+
+static int pa_set_end_index(lua_State *L)
+{
+    ((PangoAttribute *)chk_cls(L, 1, C_ATTRIBUTE))->end_index =
+        (guint)luaL_checkinteger(L, 2);
+    return 0;
+}
+
+static const luaL_Reg ATTRIBUTE_M[] = {
+    { "size_new", pa_size_new },
+    { "size_new_absolute", pa_size_new_absolute },
+    { "weight_new", pa_weight_new },
+    { "style_new", pa_style_new },
+    { "family_new", pa_family_new },
+    { "underline_new", pa_underline_new },
+    { "strikethrough_new", pa_strikethrough_new },
+    { "foreground_new", pa_foreground_new },
+    { "background_new", pa_background_new },
+    { "letter_spacing_new", pa_letter_spacing_new },
+    { "rise_new", pa_rise_new },
+    { "scale_new", pa_scale_new },
+    { "desc_new", pa_font_desc_new },
+    { "font_desc_new", pa_font_desc_new },
+    { "variant_new", pa_variant_new },
+    { "gravity_new", pa_gravity_new },
+    { "gravity_hint_new", pa_gravity_hint_new },
+    { "shape_new", pa_shape_new },
+    { "fallback_new", pa_fallback_new },
+    { "underline_color_new", pa_underline_color_new },
+    { "strikethrough_color_new", pa_strikethrough_color_new },
+    { "language_new", pa_language_new },
+    { "get_start_index", pa_get_start_index },
+    { "get_end_index", pa_get_end_index },
+    { NULL, NULL },
+};
+
+static const luaL_Reg ATTRIBUTE_PG[] = {
+    { "start_index", pa_get_start_index },
+    { "end_index", pa_get_end_index },
+    { NULL, NULL },
+};
+
+static const luaL_Reg ATTRIBUTE_P[] = {
+    { "start_index", pa_set_start_index },
+    { "end_index", pa_set_end_index },
     { NULL, NULL },
 };
 
@@ -1001,6 +1793,18 @@ luaopen_lgishim_pango(lua_State *L)
     lua_setfield(L, -2, "Context");
     class_setup(L, C_METRICS, METRICS_M, NULL, NULL);
     lua_setfield(L, -2, "FontMetrics");
+    class_setup(L, C_ATTRIBUTE, ATTRIBUTE_M, ATTRIBUTE_PG, ATTRIBUTE_P);
+    lua_setfield(L, -2, "Attribute");
+    class_setup(L, C_TABARRAY, TABARRAY_M, NULL, NULL);
+    lua_setfield(L, -2, "TabArray");
+
+    /* Rectangle is a plain table, not a userdata class: PangoRectangle has no
+     * GObject type and nothing to destroy, so class_setup() would only install
+     * an __index chain that has no object behind it. */
+    lua_newtable(L);
+    lua_pushcfunction(L, rc_new);
+    lua_setfield(L, -2, "new");
+    lua_setfield(L, -2, "Rectangle");
 
     lua_pushinteger(L, PANGO_SCALE);
     lua_setfield(L, -2, "SCALE");
@@ -1008,6 +1812,25 @@ luaopen_lgishim_pango(lua_State *L)
     lua_setfield(L, -2, "units_from_double");
     lua_pushcfunction(L, p_parse_markup);
     lua_setfield(L, -2, "parse_markup");
+
+    /* Numeric enum tables. These are deliberately NOT registered as
+     * Alignment/EllipsizeMode/WrapMode: those three are string-valued through
+     * enum_from()/enum_to() and changing them would break every existing caller.
+     */
+    install_enum_num(L, "Weight", WEIGHT,
+                     sizeof(WEIGHT) / sizeof(WEIGHT[0]));
+    install_enum_num(L, "Style", STYLE,
+                     sizeof(STYLE) / sizeof(STYLE[0]));
+    install_enum_num(L, "Stretch", STRETCH,
+                     sizeof(STRETCH) / sizeof(STRETCH[0]));
+    install_enum_num(L, "Underline", UNDERLINE,
+                     sizeof(UNDERLINE) / sizeof(UNDERLINE[0]));
+    install_enum_num(L, "Variant", VARIANT,
+                     sizeof(VARIANT) / sizeof(VARIANT[0]));
+    install_enum_num(L, "Gravity", GRAVITY,
+                     sizeof(GRAVITY) / sizeof(GRAVITY[0]));
+    install_enum_num(L, "GravityHint", GRAVITYHINT,
+                     sizeof(GRAVITYHINT) / sizeof(GRAVITYHINT[0]));
     return 1;
 }
 
