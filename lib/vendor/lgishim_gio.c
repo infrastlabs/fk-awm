@@ -33,6 +33,11 @@
  *                     is_type_of; the same methods are also installed on the
  *                     three concrete stream metatables, since lib/ calls them
  *                     on instances
+ *   AppInfo:          get_all, get_id, get_name, get_description,
+ *                     get_executable, get_commandline, get_icon,
+ *                     should_show, launch
+ *   DesktopAppInfo:   new, get_string
+ *   Icon:             to_string
  *   DBusConnection:   new_sync, call_sync, emit_signal, register_object,
  *                     close, close_sync, is_closed, flush_sync,
  *                     get_unique_name
@@ -140,6 +145,9 @@ enum {
     C_DBUSSIGNAL,
     C_DBUSIFACE,
     C_INSTREAM,
+    C_APPINFO,
+    C_DESKTOPAPPINFO,
+    C_ICON,
     N_GIO_CLASSES
 };
 
@@ -160,6 +168,9 @@ static const char *CLS_NAMES[N_GIO_CLASSES] = {
     "lgishim_gio.DBusSignalInfo",
     "lgishim_gio.DBusInterfaceInfo",
     "lgishim_gio.InputStream",
+    "lgishim_gio.AppInfo",
+    "lgishim_gio.DesktopAppInfo",
+    "lgishim_gio.Icon",
 };
 
 #define REG_CLASSES "lgishim_gio_classes"
@@ -1810,6 +1821,251 @@ install_instream_methods(lua_State *L)
     }
 }
 
+/* =========================================================== AppInfo family */
+
+/*
+ * Theme-side app-launcher surface (awful-dots), the last Gio gap in the
+ * launcher chain:
+ *   bling/widget/app_launcher/init.lua:545-637 generate_apps()
+ *     local app_info = Gio.AppInfo
+ *     local apps = app_info.get_all()                  -- Lua array table
+ *     app_info.get_name(a) / app.should_show(app)      -- class-table shape
+ *     app_info.get_commandline(app) / .get_executable(app) / .get_icon(app)
+ *     Gio.DesktopAppInfo.new(app_info.get_id(app))
+ *     Gio.DesktopAppInfo.get_string(dai, "Terminal") / (dai, "GenericName")
+ *   popups/launcher/launcher2.lua:173-190, 292, 365
+ *     for _, entry in ipairs(Gio.AppInfo.get_all()) do
+ *     entry:should_show() / :get_name() / :get_icon() / :get_description()
+ *     icon:to_string() ; entry.appinfo:launch()
+ *   bling/helpers/icon_theme.lua:71-79
+ *     Gio.AppInfo.get_all()
+ *
+ * Both call shapes reach the same C function with the object at arg 1: the
+ * same luaL_Reg table is installed on the class table AND on the instance
+ * metatable (the clsinfo "m" table), so Gio.AppInfo.get_name(a) and
+ * a:get_name() are both fine.
+ *
+ * gdesktopappinfo.h is absent from this glib's installed headers (see the
+ * missing-header list at the top of this file), so GDesktopAppInfo and its
+ * two functions are forward-declared with the shapes libgi generates.  Both
+ * symbols are present in libgio-2.0.
+ */
+typedef struct _GDesktopAppInfo GDesktopAppInfo;
+
+GAppInfo *g_desktop_app_info_new(const gchar *id, GError **error);
+gchar *g_desktop_app_info_get_string(GDesktopAppInfo *info, const gchar *key);
+
+/* push_str_or_nil(): most getters below return const char * and must yield
+ * Lua nil rather than a NULL push (Lua 5.3 asserts on that). */
+static int
+push_str_or_nil(lua_State *L, const char *s)
+{
+    if (s)
+        lua_pushstring(L, s);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+/*
+ * g_app_info_get_all() is CONTAINER transfer: the elements stay owned by the
+ * live app-info monitor and the returned GList only holds the pointers, so
+ * each element has to be ref'd here before wrapping.  Handing the list's
+ * pointers to the wrappers as-is would let __gc() free objects the monitor
+ * still has live.  g_list_free() frees the nodes only.
+ *
+ * Probed on a host with 52 .desktop apps: ref one element, g_list_free(),
+ * unref it, and the object survives -- so the list never owned it (a FULL
+ * transfer list would have dropped its refcount to zero).
+ */
+static int
+appinfo_get_all(lua_State *L)
+{
+    GList *l = g_app_info_get_all();
+    GList *it;
+    lua_Integer i = 0;
+
+    lua_createtable(L, (int)g_list_length(l), 0);
+    for (it = l; it != NULL; it = it->next) {
+        g_object_ref(it->data);
+        i++;
+        push_obj(L, it->data, d_object, C_APPINFO);
+        lua_rawseti(L, -2, i);
+    }
+    g_list_free(l);
+    return 1;
+}
+
+static int
+appinfo_get_id(lua_State *L)
+{
+    return push_str_or_nil(L, g_app_info_get_id(chk_cls(L, 1, C_APPINFO)));
+}
+
+static int
+appinfo_get_name(lua_State *L)
+{
+    return push_str_or_nil(L, g_app_info_get_name(chk_cls(L, 1, C_APPINFO)));
+}
+
+static int
+appinfo_get_description(lua_State *L)
+{
+    return push_str_or_nil(L,
+                           g_app_info_get_description(chk_cls(L, 1, C_APPINFO)));
+}
+
+static int
+appinfo_get_executable(lua_State *L)
+{
+    return push_str_or_nil(L,
+                           g_app_info_get_executable(chk_cls(L, 1, C_APPINFO)));
+}
+
+static int
+appinfo_get_commandline(lua_State *L)
+{
+    /* const char * in this glib 2.70 build -- a single string, not char **. */
+    return push_str_or_nil(L,
+        g_app_info_get_commandline(chk_cls(L, 1, C_APPINFO)));
+}
+
+static int
+appinfo_should_show(lua_State *L)
+{
+    lua_pushboolean(L, g_app_info_should_show(chk_cls(L, 1, C_APPINFO))
+                      ? TRUE : FALSE);
+    return 1;
+}
+
+/*
+ * g_app_info_get_icon() is transfer none: the AppInfo owns the icon for its
+ * whole lifetime, so the wrapper takes a ref of its own, or __gc() would
+ * unref an icon the AppInfo still holds.  NULL is possible (no Icon= key),
+ * and launcher2.lua:178-181 / icon_theme:get_gicon_path() both treat nil as
+ * "no icon", so a nil is pushed rather than erroring out.
+ */
+static int
+appinfo_get_icon(lua_State *L)
+{
+    GIcon *icon = g_app_info_get_icon(chk_cls(L, 1, C_APPINFO));
+
+    if (!icon) {
+        lua_pushnil(L);
+        return 1;
+    }
+    g_object_ref(icon);
+    return push_obj(L, icon, d_object, C_ICON);
+}
+
+/*
+ * launcher2.lua:292 and :365 call entry.appinfo:launch() with no arguments.
+ * NULL files and a NULL context mean "no files, non-interactively".
+ */
+static int
+appinfo_launch(lua_State *L)
+{
+    GAppInfo *info = chk_cls(L, 1, C_APPINFO);
+    GError *err = NULL;
+
+    if (!lua_isnoneornil(L, 2))
+        luaL_error(L, "lgishim_gio: AppInfo:launch(files) is not supported");
+
+    if (g_app_info_launch(info, NULL, NULL, &err))
+        lua_pushboolean(L, TRUE);
+    else {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+    }
+    return 2;
+}
+
+static const luaL_Reg APPINFO_M[] = {
+    { "get_all",         appinfo_get_all },
+    { "get_id",          appinfo_get_id },
+    { "get_name",        appinfo_get_name },
+    { "get_description", appinfo_get_description },
+    { "get_executable",  appinfo_get_executable },
+    { "get_commandline", appinfo_get_commandline },
+    { "get_icon",        appinfo_get_icon },
+    { "should_show",     appinfo_should_show },
+    { "launch",          appinfo_launch },
+    { NULL, NULL },
+};
+
+/* ---- DesktopAppInfo ---- */
+
+static int
+desktopappinfo_new(lua_State *L)
+{
+    GError *err = NULL;
+    GAppInfo *info = g_desktop_app_info_new(luaL_checkstring(L, 1), &err);
+
+    if (!info) {
+        lua_pushnil(L);
+        push_error(L, err);
+        g_clear_error(&err);
+        return 2;
+    }
+    return push_obj(L, info, d_object, C_DESKTOPAPPINFO);
+}
+
+/*
+ * Unlike the const char * getters on GAppInfo, get_string() returns a freshly
+ * allocated string (it goes through g_key_file_get_string).  NULL means "key
+ * absent", which is exactly how app_launcher decides generic_name is nil and
+ * Terminal is false.
+ */
+static int
+desktopappinfo_get_string(lua_State *L)
+{
+    gchar *s = g_desktop_app_info_get_string(
+        (GDesktopAppInfo *)chk_cls(L, 1, C_DESKTOPAPPINFO),
+        luaL_checkstring(L, 2));
+
+    if (s) {
+        lua_pushstring(L, s);
+        g_free(s);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+static const luaL_Reg DESKTOPAPPINFO_M[] = {
+    { "new",        desktopappinfo_new },
+    { "get_string", desktopappinfo_get_string },
+    { NULL, NULL },
+};
+
+/* ---- Icon ---- */
+
+/*
+ * This build's gio/gicon.h only declares g_icon_to_string() and
+ * g_icon_new_for_string() -- no g_themed_icon_new -- so Icon stays thin.  The
+ * Gtk.IconTheme lookup a real launcher does next (launcher2.lua:181) is a
+ * separate shim module that is still out of scope.
+ */
+static int
+icon_to_string(lua_State *L)
+{
+    gchar *s = g_icon_to_string(chk_cls(L, 1, C_ICON));
+
+    if (s) {
+        lua_pushstring(L, s);
+        g_free(s);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+static const luaL_Reg ICON_M[] = {
+    { "to_string", icon_to_string },
+    { NULL, NULL },
+};
+
 /* ============================================================ D-Bus */
 
 /*
@@ -2932,6 +3188,12 @@ luaopen_lgishim_gio(lua_State *L)
     lua_setfield(L, -2, "DBusSignalInfo");
     class_setup(L, C_DBUSIFACE,   DBUSIFACE_M, NULL);
     lua_setfield(L, -2, "DBusInterfaceInfo");
+    class_setup(L, C_APPINFO,      APPINFO_M, NULL);
+    lua_setfield(L, -2, "AppInfo");
+    class_setup(L, C_DESKTOPAPPINFO, DESKTOPAPPINFO_M, NULL);
+    lua_setfield(L, -2, "DesktopAppInfo");
+    class_setup(L, C_ICON,         ICON_M, NULL);
+    lua_setfield(L, -2, "Icon");
 
     install_enum(L, "BusType", BUS_TYPES, G_N_ELEMENTS(BUS_TYPES));
     install_enum(L, "BusNameOwnerFlags", BUS_NAME_OWNER_FLAGS,
