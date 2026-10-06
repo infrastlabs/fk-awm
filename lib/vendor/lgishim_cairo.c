@@ -1368,6 +1368,10 @@ static const luaL_Reg SURF_M[] = {
 
 static const luaL_Reg IMAGE_M[] = {
     { "new", image_surface_new },
+    /* .create() is the lgi-idiomatic constructor name; Pattern/Context/Region
+     * all expose .create(), so ImageSurface exposing only .new was an internal
+     * inconsistency. Aliased to the same handler — no new logic. */
+    { "create", image_surface_new },
     { "create_for_data", image_surface_create_for_data },
     { NULL, NULL },
 };
