@@ -14,8 +14,9 @@
  * pointer.
  *
  * Public API (docs/sam/spike4-phase2-05-glib-gio-scope.md, Gio section):
- *   File:             new_for_path, new_for_uri, get_parent, get_child,
- *                     get_path, get_uri, get_basename, get_display_name,
+ *   File:             new_for_path, new_for_uri, new_for_commandline_arg,
+ *                     get_parent, get_child, get_path, get_uri,
+ *                     get_basename, get_display_name,
  *                     query_info, query_file_type, query_exists,
  *                     make_directory, make_directory_with_parents, delete,
  *                     enumerate_children, async_enumerate_children
@@ -28,6 +29,10 @@
  *                     set_buffer_size, close
  *   MemoryInputStream:new_from_data
  *   UnixInputStream:  new, get_fd
+ *   InputStream:      class table only: read, read_all, read_async,
+ *                     is_type_of; the same methods are also installed on the
+ *                     three concrete stream metatables, since lib/ calls them
+ *                     on instances
  *   DBusConnection:   new_sync, call_sync, emit_signal, register_object,
  *                     close, close_sync, is_closed, flush_sync,
  *                     get_unique_name
@@ -41,7 +46,7 @@
  *                     DBusInterfaceInfo -- marshalled into a real
  *                     GDBusNodeInfo/GDBusInterfaceInfo pair through
  *                     g_dbus_node_info_new_for_xml()
- *   module functions: bus_get_sync, bus_own_name, Async.start
+ *   module functions: bus_get_sync, bus_own_name, Async.start, Async.call
  *   enum constants:   BusType, BusNameOwnerFlags, DBusProxyFlags,
  *                     DBusCallFlags, FileQueryInfoFlags, FileType,
  *                     IOErrorEnum, FILE_ATTRIBUTE_*
@@ -134,6 +139,7 @@ enum {
     C_DBUSMETHOD,
     C_DBUSSIGNAL,
     C_DBUSIFACE,
+    C_INSTREAM,
     N_GIO_CLASSES
 };
 
@@ -153,6 +159,7 @@ static const char *CLS_NAMES[N_GIO_CLASSES] = {
     "lgishim_gio.DBusMethodInfo",
     "lgishim_gio.DBusSignalInfo",
     "lgishim_gio.DBusInterfaceInfo",
+    "lgishim_gio.InputStream",
 };
 
 #define REG_CLASSES "lgishim_gio_classes"
@@ -831,6 +838,13 @@ file_new_for_path(lua_State *L)
 }
 
 static int
+file_new_for_commandline_arg(lua_State *L)
+{
+    const char *arg = luaL_checkstring(L, 1);
+    return push_obj(L, g_file_new_for_commandline_arg(arg), d_object, C_FILE);
+}
+
+static int
 file_new_for_uri(lua_State *L)
 {
     const char *uri = luaL_checkstring(L, 1);
@@ -1223,6 +1237,7 @@ fileenum_close(lua_State *L)
 
 static const luaL_Reg FILE_M[] = {
     { "new_for_path",                file_new_for_path },
+    { "new_for_commandline_arg",      file_new_for_commandline_arg },
     { "new_for_uri",                 file_new_for_uri },
     { "new_tmp",                     file_new_tmp },
     { "get_parent",                  file_get_parent },
@@ -1528,6 +1543,224 @@ unixin_get_fd(lua_State *L)
     return 1;
 }
 
+/* ====================================================== InputStream (base) */
+
+/*
+ * InputStream is the base of DataInputStream / MemoryInputStream /
+ * UnixInputStream, but the shim never wraps a bare GInputStream: datain_new(),
+ * memin_new_from_data() and unixin_new() always produce one of the three. So
+ * the InputStream class table has no metatable and no `new` -- just the methods
+ * that apply to any GInputStream plus is_type_of(). luaopen_lgishim_gio()
+ * installs those methods on the three concrete metatables as well, because
+ * lib/ calls them on instances (`stream:read(n)`), not on the class.
+ */
+
+/*
+ * chk_cls() accepts a single class, but the InputStream methods have to accept
+ * all three concrete stream classes. A DataInputStream wraps a datain_ctx, so
+ * its GInputStream sits one level down in ->stream; the other two hold the
+ * GInputStream directly.
+ */
+static GInputStream *
+chk_instream(lua_State *L, int idx)
+{
+    wrap *w = getud(L, idx);
+    const char *got = luaL_typename(L, idx);
+
+    if (!w || !w->p)
+        luaL_error(L, "lgishim_gio: expected a Gio.InputStream at arg %d, "
+                   "got %s", idx, got);
+    if (w->cls != C_DATAIN && w->cls != C_MEMIN && w->cls != C_UNIXIN) {
+        got = (w->cls >= 1 && w->cls < N_GIO_CLASSES) ? CLS_NAMES[w->cls] : got;
+        luaL_error(L, "lgishim_gio: expected a Gio.InputStream at arg %d, "
+                   "got %s", idx, got);
+    }
+    return (GInputStream *)((w->cls == C_DATAIN) ? (((datain_ctx *)w->p)->stream)
+                                                 : w->p);
+}
+
+static int
+instream_read(lua_State *L)
+{
+    GInputStream *s = chk_instream(L, 1);
+    lua_Integer count = luaL_checkinteger(L, 2);
+    char *buf;
+    gssize n;
+    GError *err = NULL;
+
+    luaL_argcheck(L, count > 0, 2, "count must be > 0");
+
+    buf = g_try_malloc((gsize)count);
+    if (!buf)
+        luaL_error(L, "lgishim_gio: out of memory");
+
+    n = g_input_stream_read(s, buf, (gsize)count, NULL, &err);
+    if (n < 0) {
+        /* Same shape as datain_read_line(): nil + the message, which is what
+         * spawn.lua's `type(length) ~= "number"` test distinguishes. */
+        lua_pushnil(L);
+        lua_pushstring(L, err ? err->message : "read error");
+        g_clear_error(&err);
+        g_free(buf);
+        return 2;
+    }
+    lua_pushlstring(L, buf, (size_t)n);
+    lua_pushinteger(L, (lua_Integer)n);
+    g_free(buf);
+    return 2;
+}
+
+static int
+instream_read_all(lua_State *L)
+{
+    GInputStream *s = chk_instream(L, 1);
+    GString *acc = g_string_new(NULL);
+    char buf[4096];
+    gssize n;
+    GError *err = NULL;
+
+    /* g_input_stream_read() may return short reads, so loop until EOF (0);
+     * only n < 0 is an error. Iterative on purpose -- a recursive version
+     * would blow the C stack on a large stream. */
+    while ((n = g_input_stream_read(s, buf, sizeof(buf), NULL, &err)) > 0)
+        g_string_append_len(acc, buf, (gsize)n);
+
+    if (n < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, err ? err->message : "read error");
+        g_clear_error(&err);
+        g_string_free(acc, TRUE);
+        return 2;
+    }
+    lua_pushlstring(L, acc->str, acc->len);
+    lua_pushinteger(L, (lua_Integer)acc->len);
+    g_string_free(acc, TRUE);
+    return 2;
+}
+
+/*
+ * read_async(nbytes, priority, cancellable, callback, user_data)
+ *
+ * The synchronous read happens in the idle source, exactly like
+ * datain_async_dispatch(): calling the callback from read_async() would make
+ * spawn.lua's start_read -> read_line_async -> callback -> start_read chain
+ * recurse on the C stack for the whole stream (the C-stack-overflow that
+ * 758b5aaa fixed for read_line_async). `priority` is the idle source priority;
+ * `cancellable` is accepted but not honoured -- a synchronous read inside an
+ * idle source cannot be aborted mid-read.
+ */
+typedef struct {
+    lua_State *L;
+    int stream_ref;   /* pins the wrapper (and a DataInputStream's datain_ctx) */
+    int cb_ref;
+    GInputStream *stream;  /* g_object_ref'ed: the idle source must not dangle */
+    char *buffer;
+    gsize nbytes;
+} instream_async_cbdata;
+
+static gboolean
+instream_async_dispatch(gpointer user_data)
+{
+    instream_async_cbdata *d = (instream_async_cbdata *)user_data;
+    lua_State *L = d->L;
+    int errf;
+    gssize n;
+    GError *err = NULL;
+
+    n = g_input_stream_read(d->stream, d->buffer, d->nbytes, NULL, &err);
+
+    /* [tb][cb][obj][result] so lua_pcall's fn = top-nargs lands on the cb, the
+     * same layout datain_async_dispatch() uses. */
+    errf = push_traceback_h(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, d->cb_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, d->stream_ref);
+    lua_newtable(L);                              /* result */
+    if (n >= 0) {
+        lua_pushlstring(L, d->buffer, (size_t)n);
+        lua_setfield(L, -2, "data");
+        lua_pushinteger(L, (lua_Integer)n);
+        lua_setfield(L, -2, "length");
+    } else {
+        lua_pushstring(L, err ? err->message : "read error");
+        lua_setfield(L, -2, "error");
+    }
+    if (lua_pcall(L, 2, 0, errf) != 0) {
+        g_printerr("lgishim_gio read_async error: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    luaL_unref(L, LUA_REGISTRYINDEX, d->cb_ref);
+    luaL_unref(L, LUA_REGISTRYINDEX, d->stream_ref);
+    g_clear_error(&err);
+    g_object_unref(d->stream);
+    g_free(d->buffer);
+    g_free(d);
+    lua_settop(L, 0);
+    return G_SOURCE_REMOVE;
+}
+
+static int
+instream_read_async(lua_State *L)
+{
+    GInputStream *s = chk_instream(L, 1);
+    lua_Integer nbytes = luaL_checkinteger(L, 2);
+    int prio = (int)luaL_optinteger(L, 3, G_PRIORITY_DEFAULT);
+    instream_async_cbdata *d;
+
+    luaL_argcheck(L, nbytes > 0, 2, "nbytes must be > 0");
+    luaL_checktype(L, 5, LUA_TFUNCTION);
+
+    d = g_new0(instream_async_cbdata, 1);
+    d->L = L;
+    d->stream = s;
+    g_object_ref(s);
+    d->nbytes = (gsize)nbytes;
+    d->buffer = g_try_malloc(d->nbytes);
+    if (!d->buffer) {
+        g_object_unref(s);
+        g_free(d);
+        luaL_error(L, "lgishim_gio: out of memory");
+    }
+
+    /* The Lua ref keeps the wrapper alive until the idle tick; the G ref
+     * above keeps the GInputStream itself alive once it is collected. */
+    lua_pushvalue(L, 1);
+    d->stream_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pushvalue(L, 5);
+    d->cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    g_idle_add_full(prio, instream_async_dispatch, d, NULL);
+    return 0;
+}
+
+/*
+ * InputStream has no metatable of its own, so is_type_of() has to match the
+ * three concrete subclasses. Metatable identity is the discriminator, as in
+ * m_is_type_of(): a wrap from another shim with a colliding cls value would
+ * not match, which keeps e.g. an lgishim_glib Variant from passing as a
+ * stream.
+ */
+static int
+m_is_type_of_instream(lua_State *L)
+{
+    int i, same = 0;
+
+    if (!lua_getmetatable(L, 2)) {
+        lua_pushboolean(L, FALSE);
+        return 1;
+    }
+    for (i = 1; i <= 3; i++) {
+        lua_pushvalue(L, lua_upvalueindex(i));
+        if (lua_rawequal(L, -2, -1)) {
+            same = 1;
+            break;
+        }
+        lua_pop(L, 1);
+    }
+    lua_settop(L, 0);
+    lua_pushboolean(L, same ? TRUE : FALSE);
+    return 1;
+}
+
 static const luaL_Reg DATAIN_M[] = {
     { "new",                datain_new },
     { "read_line",          datain_read_line },
@@ -1549,6 +1782,33 @@ static const luaL_Reg UNIXIN_M[] = {
     { "get_fd", unixin_get_fd },
     { NULL, NULL },
 };
+
+/* Shared by the InputStream class table and the three concrete metatables. */
+static const luaL_Reg INSTREAM_M[] = {
+    { "read",       instream_read },
+    { "read_all",   instream_read_all },
+    { "read_async", instream_read_async },
+    { NULL, NULL },
+};
+
+/*
+ * lib/ calls the InputStream methods on concrete instances (`stream:read(n)`),
+ * so they must land on the three stream metatables, not just on the InputStream
+ * class table. m_index() finds them through its metatable fallback, so a second
+ * entry in the registry clsinfo is unnecessary.
+ */
+static void
+install_instream_methods(lua_State *L)
+{
+    static const int stream_cls[] = { C_DATAIN, C_MEMIN, C_UNIXIN };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(stream_cls); i++) {
+        luaL_getmetatable(L, CLS_NAMES[stream_cls[i]]);
+        luaL_setfuncs(L, INSTREAM_M, 0);
+        lua_pop(L, 1);
+    }
+}
 
 /* ============================================================ D-Bus */
 
@@ -2392,7 +2652,7 @@ gio_bus_get(lua_State *L)
     return 0;
 }
 
-/* --- Gio.Async (start only): menubar/utils.lua:407 does
+/* --- Gio.Async: menubar/utils.lua:407 does
  *   gio.Async.start(do_protected_call)(function() ... end)
  * The real LGI version schedules a GTask; with no main loop to defer to,
  * running the task immediately inside do_protected_call() is equivalent
@@ -2413,6 +2673,116 @@ gio_async_start(lua_State *L)
     luaL_checktype(L, 1, LUA_TFUNCTION);
     lua_pushvalue(L, 1);
     lua_pushcclosure(L, gio_async_run, 1);
+    return 1;
+}
+
+/* --- Gio.Async.call: `Gio.Async.call(func, cancellable, io_priority)`
+ * returns a starter; calling the starter runs func(...) and returns its
+ * results. Faithful to lgi's override: the body runs in a coroutine spawned
+ * from an idle source inside a nested GMainLoop, and the nested loop is what
+ * gives it lgi's modality -- work scheduled from inside the body still reaches
+ * the main loop while the starter is blocked, and the results come back through
+ * the same call. Async.start() above is a different beast and is untouched.
+ *
+ * `cancellable` is accepted but not forwarded (the shim has no GCancellable);
+ * `io_priority` becomes the idle source priority, like the async-context
+ * priority in the real override.
+ */
+
+typedef struct {
+    lua_State *L;
+    lua_State *t;      /* the body's coroutine, pinned by this ctx */
+    GMainLoop *loop;
+    int nargs;
+} async_call_ctx;
+
+static gboolean
+async_call_idle(gpointer user_data)
+{
+    async_call_ctx *c = (async_call_ctx *)user_data;
+
+    /* The coroutine already holds the body, so move the starter's args on top
+     * of it first; lua_resume() then hands them to the body. */
+    if (c->nargs > 0)
+        lua_xmove(c->L, c->t, c->nargs);
+
+    switch (lua_resume(c->t, c->L, c->nargs)) {
+    case LUA_OK: {
+        /* The results sit on the coroutine's stack; move them onto the outer
+         * one so the starter can return them from its own top. */
+        int n = lua_gettop(c->t);
+        if (n > 0)
+            lua_xmove(c->t, c->L, n);
+        break;
+    }
+    case LUA_YIELD:
+        /* lgi leaves the coroutine suspended until a resumed async callback
+         * finishes it. This shim has no GAsyncReady dispatch that would
+         * resume it, so the loop is quit instead: the caller gets no results
+         * rather than an infinite hang. */
+        g_printerr("lgishim_gio: Async.call body yielded; nothing in this shim "
+                   "would resume it, so no results are returned\n");
+        break;
+    default:
+        g_printerr("lgishim_gio: Async.call body error: %s\n",
+                   lua_tostring(c->t, -1));
+        break;
+    }
+
+    g_main_loop_quit(c->loop);
+    g_free(c);
+    return G_SOURCE_REMOVE;
+}
+
+static int
+async_call_start(lua_State *L)
+{
+    lua_State *t;
+    int prio = (int)luaL_checkinteger(L, lua_upvalueindex(2));
+    int nargs;
+    GMainLoop *loop;
+    async_call_ctx *c;
+
+    luaL_checkstack(L, LUA_EXTRASPACE, "lgishim_gio: Async.call nested too deep");
+
+    /* A fresh coroutine per starter call: a coroutine may only be resumed once,
+     * and lgi's starter is reusable. The body goes on the coroutine's stack
+     * first, and the thread is dropped again so lua_gettop() below counts only
+     * the caller's arguments. */
+    t = lua_newthread(L);
+    lua_pushvalue(L, lua_upvalueindex(1));      /* the body */
+    lua_xmove(L, t, 1);
+    lua_pop(L, 1);                              /* the thread */
+    /* lua_gettop() excludes this closure, so no -1: in Lua 5.2+ the function
+     * being called sits above the top, and index 1 is the first argument. */
+    nargs = lua_gettop(L);
+
+    c = g_new0(async_call_ctx, 1);
+    c->L = L;
+    c->t = t;
+    c->nargs = nargs;
+    c->loop = loop = g_main_loop_new(NULL, FALSE);
+
+    /* Spawn the body inside an idle source, not inline: if the coroutine
+     * finishes during its first resume, an inline resume would quit the loop
+     * before the loop had a chance to enter at all. */
+    g_idle_add_full(prio, async_call_idle, c, NULL);
+    g_main_loop_run(loop);
+    g_main_loop_unref(loop);
+    /* The idle source moved the results onto the top and freed the ctx. */
+    return lua_gettop(L);
+}
+
+static int
+gio_async_call(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+
+    /* The body is captured by the starter, which builds the coroutine; the
+     * thread is pinned by the ctx while the nested loop runs. */
+    lua_pushvalue(L, 1);
+    lua_pushinteger(L, (lua_Integer)luaL_optinteger(L, 3, G_PRIORITY_DEFAULT));
+    lua_pushcclosure(L, async_call_start, 2);
     return 1;
 }
 
@@ -2530,6 +2900,22 @@ luaopen_lgishim_gio(lua_State *L)
     lua_setfield(L, -2, "MemoryInputStream");
     class_setup(L, C_UNIXIN,      UNIXIN_M, NULL);
     lua_setfield(L, -2, "UnixInputStream");
+
+    /* InputStream is a base class only: the three stream metatables get the
+     * shared methods, and the class table carries them plus is_type_of(),
+     * which matches any of the three subclass metatables (see
+     * m_is_type_of_instream()). No metatable and no `new`: the shim never
+     * wraps a bare GInputStream. */
+    install_instream_methods(L);
+    lua_newtable(L);                           /* InputStream class table */
+    luaL_setfuncs(L, INSTREAM_M, 0);
+    luaL_getmetatable(L, CLS_NAMES[C_DATAIN]);
+    luaL_getmetatable(L, CLS_NAMES[C_MEMIN]);
+    luaL_getmetatable(L, CLS_NAMES[C_UNIXIN]);
+    lua_pushcclosure(L, m_is_type_of_instream, 3);
+    lua_setfield(L, -2, "is_type_of");
+    lua_setfield(L, -2, "InputStream");
+
     class_setup(L, C_DBUSCONN,    DBUSCONN_M, NULL);
     lua_setfield(L, -2, "DBusConnection");
     class_setup(L, C_DBUSPROXY,   DBUSPROXY_M, NULL);
@@ -2586,6 +2972,8 @@ luaopen_lgishim_gio(lua_State *L)
     lua_newtable(L);
     lua_pushcfunction(L, gio_async_start);
     lua_setfield(L, -2, "start");
+    lua_pushcfunction(L, gio_async_call);
+    lua_setfield(L, -2, "call");
     lua_setfield(L, -2, "Async");
 
     return 1;
