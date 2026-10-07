@@ -24,6 +24,7 @@ if ok and type(Pango) == "table" then
     local ok5, GLib = pcall(require, "lgishim_glib")
     local ok6, GObject = pcall(require, "lgishim_gobject")
     local ok7, Gio = pcall(require, "lgishim_gio")
+    local ok8, Gtk = pcall(require, "lgishim_gtk")
     M = {
         shim = true,
         Pango = Pango,
@@ -32,6 +33,7 @@ if ok and type(Pango) == "table" then
         GdkPixbuf = ok4 and GdkPixbuf or {},
         GLib = ok5 and GLib or {},
         Gio = ok7 and Gio or {},
+        Gtk = ok8 and Gtk or {},
         Rsvg = {},
         GObject = ok6 and GObject or {},
     }
@@ -44,6 +46,14 @@ if ok and type(Pango) == "table" then
     -- what makes the call resolvable under the shim at all.
     M.Gdk = M.GdkPixbuf
     M.gio = M.Gio
+    -- lgi.require("Gtk","3.0") is how third-party themes reach a GI module by
+    -- name. Return the namespace table only when it is actually populated, so
+    -- an unimplemented namespace degrades to nil instead of an empty table
+    -- (an empty table would make `Gtk.IconTheme` nil and crash the caller).
+    function M.require(name)
+        local t = M[name]
+        return type(t) == "table" and next(t) ~= nil and t or nil
+    end
     -- C-side copy of the class table would be a *distinct* table, so the
     -- lowercase class alias is bound here where the assignment is a real
     -- identity copy (lib/menubar/utils.lua et al. look for `pixbuf`).
