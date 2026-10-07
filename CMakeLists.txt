@@ -136,6 +136,7 @@ if(AWESOME_LGISHIM)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_pixbuf.c)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gobject.c)
     list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gio.c)
+    list(APPEND AWE_SRCS ${SOURCE_DIR}/lib/vendor/lgishim_gtk.c)
     # pkg_check_modules 的 prefix 是 LGISHIM_PANGO_REQUIRED / LGISHIM_PIXBUF_REQUIRED，
     # 所以变量名必须带 _REQUIRED。用错成 LGISHIM_PANGO_INCLUDE_DIRS 在干净 build dir
     # 里是空的，pango/pangocairo.h 直接找不到；只有带着历史 CMakeCache 的旧 build dir
@@ -152,6 +153,7 @@ if(AWESOME_LGISHIM)
     # has no pangocairo requirement, so it stays out of pkg_check_modules.
     include_directories(/usr/local/include/librsvg-2.0)
     add_definitions(-DHAVE_LIBRSVG)
+    add_definitions(-DAWESOME_LGISHIM)
     list(APPEND AWESOME_REQUIRED_LDFLAGS
         -Wl,--start-group
         -l:libpangocairo-1.0.a -l:libpangoft2-1.0.a -l:libpangoxft-1.0.a
