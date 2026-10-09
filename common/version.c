@@ -47,8 +47,15 @@ eprint_version(void)
     else
         lua_pop(L, 1);
 
+#ifdef AWESOME_LGISHIM
+    /* Static shim build: there is no real lgi to report, and the bare
+     * require('lgi.version') in the shared branch would dump the module
+     * search-path error into the -v output. */
+    lua_pushstring(L, "lgishim (static)");
+#else
     /* Either push version number or error message onto stack */
     (void) luaL_dostring(L, "return require('lgi.version')");
+#endif
 
 #ifdef WITH_DBUS
     const char *has_dbus = "yes";
