@@ -49,6 +49,7 @@
 #include <ctype.h>
 #include <setjmp.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1047,11 +1048,21 @@ surface_to_pixbuf(cairo_surface_t *surface, int sx, int sy, int w, int h)
      * bits_per_sample 8.  Passing 24 (the depth) makes gdk-pixbuf compute
      * bits_per_sample 6 and trips gdk_pixbuf_calculate_rowstride()'s
      * 'bits_per_sample == 8' assertion, so the allocation returns an unusable
-     * pixbuf.  The bytes are copied verbatim, so cairo's ARGB32 premultiplied
-     * alpha stays premultiplied, exactly as upstream's glue does; no
-     * un-premultiplication is applied here.  The pixbuf owns its own copy of
-     * the bytes, so the wrap's d_pixbuf releases it exactly once and no
-     * borrowed pointer escapes. */
+     * pixbuf.
+     *
+     * cairo's ARGB32 is premultiplied and stored in native byte order; a
+     * GdkPixbuf is straight (non-premultiplied) RGBA.  A verbatim memcpy
+     * (what this did before 2026-10-09) therefore (a) put the bytes in the
+     * wrong channel order on little-endian (BGRx vs RGBx) and (b) kept
+     * colors premultiplied -- with low-opacity fills (e.g. titlebar SVG
+     * icons drawn as #85ACFB at opacity 0.22-0.30) the shifted, darkened
+     * channels rendered black/brown instead of the fill color.  Convert
+     * per pixel: unpremultiply, write straight R,G,B,A like the libpng path
+     * (decode_png) does, so SVG and PNG load identically.  CAIRO_ARGB32_
+     * macros decode the native-endian 32-bit word, so no byte-order
+     * assumptions beyond that.  The pixbuf owns its own copy of the bytes,
+     * so the wrap's d_pixbuf releases it exactly once and no borrowed
+     * pointer escapes. */
     pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, w, h);
     if (!pixbuf) {
         cairo_surface_destroy(tmp);
@@ -1062,9 +1073,33 @@ surface_to_pixbuf(cairo_surface_t *surface, int sx, int sy, int w, int h)
     rowsrc = (unsigned char *)data;
     dest = gdk_pixbuf_get_pixels(pixbuf);
     dststride = (size_t)gdk_pixbuf_get_rowstride(pixbuf);
-    for (row = 0; row < h; row++)
-        memcpy(dest + (size_t)row * dststride,
-               rowsrc + (size_t)row * stride, (size_t)w * 4);
+    {
+        const uint32_t *sp = (const uint32_t *)rowsrc;
+        int x;
+        for (row = 0; row < h; row++) {
+            for (x = 0; x < w; x++) {
+                unsigned char *d = dest + (size_t)row * dststride + (size_t)x * 4;
+                uint32_t p = sp[(size_t)row * (stride / 4) + x];
+                /* cairo ARGB32 as a native-endian uint32 is 0xAARRGGBB on
+                 * the little-endian targets this static build supports
+                 * (CAIRO_ARGB32_GET_* macros are not exposed by the
+                 * container's cairo.h, so extract by hand). */
+                unsigned a = (p >> 24) & 0xff;
+                unsigned r = (p >> 16) & 0xff;
+                unsigned g = (p >> 8) & 0xff;
+                unsigned b = p & 0xff;
+                if (a != 0 && a != 255) {
+                    r = (r * 255 + a / 2) / a;
+                    g = (g * 255 + a / 2) / a;
+                    b = (b * 255 + a / 2) / a;
+                }
+                d[0] = (unsigned char)r;
+                d[1] = (unsigned char)g;
+                d[2] = (unsigned char)b;
+                d[3] = (unsigned char)a;
+            }
+        }
+    }
     cairo_surface_destroy(tmp);
 
     return pixbuf;
