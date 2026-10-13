@@ -38,7 +38,7 @@
 #include "objects/screen.h"
 #include "common/atoms.h"
 #include "common/xutil.h"
-
+#include <cairo.h>
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
 #include <xcb/shape.h>
@@ -951,6 +951,23 @@ event_handle_shape_notify(xcb_shape_notify_event_t *ev)
             luaA_object_emit_signal(L, -1, "property::shape_client_bounding", 0);
         if (ev->shape_kind == XCB_SHAPE_SK_CLIP)
             luaA_object_emit_signal(L, -1, "property::shape_client_clip", 0);
+        if (ev->shape_kind == XCB_SHAPE_SK_INPUT && globalconf.have_input_shape)
+        {
+            /* Propagate a client-set input shape onto its frame window: shaped
+             * docks (e.g. plank) size their window larger than the visible
+             * dock and rely on the input shape to let clicks in the
+             * transparent/expanded area fall through.  awesome's frame would
+             * otherwise eat the whole rectangle. */
+            cairo_surface_t *surf = xwindow_get_shape(ev->affected_window,
+                                                      XCB_SHAPE_SK_INPUT);
+            xwindow_set_shape(c->frame_window,
+                              c->geometry.width + c->border_width * 2,
+                              c->geometry.height + c->border_width * 2,
+                              XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+            if (surf)
+                cairo_surface_destroy(surf);
+            luaA_object_emit_signal(L, -1, "property::shape_client_input", 0);
+        }
         lua_pop(L, 1);
     }
 }

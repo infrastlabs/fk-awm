@@ -2222,6 +2222,21 @@ client_manage(xcb_window_t w, xcb_get_geometry_reply_t *wgeom, xcb_get_window_at
     /* Set border width */
     window_set_border_width(L, -1, wgeom->border_width);
 
+    /* Apply any input shape the client already set before mapping to the
+     * frame, so clicks outside the visible area of shaped docks (plank) pass
+     * through right away; later changes arrive via shape notify (event.c). */
+    if (globalconf.have_input_shape)
+    {
+        cairo_surface_t *surf = xwindow_get_shape(c->window,
+                                                  XCB_SHAPE_SK_INPUT);
+        xwindow_set_shape(c->frame_window,
+                          c->geometry.width + c->border_width * 2,
+                          c->geometry.height + c->border_width * 2,
+                          XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+        if (surf)
+            cairo_surface_destroy(surf);
+    }
+
     /* we honor size hints by default */
     c->size_hints_honor = true;
     luaA_object_emit_signal(L, -1, "property::size_hints_honor", 0);
