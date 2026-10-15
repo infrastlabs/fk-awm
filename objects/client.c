@@ -2013,6 +2013,21 @@ client_geometry_refresh(void)
         c->x11_frame_geometry = geometry;
         c->x11_client_geometry = real_geometry;
 
+        /* Keep the frame's input region in sync with the client: rebuild it
+         * from the client's current input shape (full window for ordinary
+         * clients, restricted for shaped docks like plank).  Without this,
+         * the frame keeps the input mask applied at manage time and the
+         * growth area of a resize becomes a click dead zone. */
+        if (globalconf.have_input_shape)
+        {
+            cairo_surface_t *surf = xwindow_get_shape(c->window,
+                                                      XCB_SHAPE_SK_INPUT);
+            xwindow_set_shape(c->frame_window, geometry.width, geometry.height,
+                              XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+            if (surf)
+                cairo_surface_destroy(surf);
+        }
+
         /* ICCCM 4.2.3 says something else, but Java always needs this... */
         client_send_configure(c);
         c->got_configure_request = false;
@@ -2224,7 +2239,9 @@ client_manage(xcb_window_t w, xcb_get_geometry_reply_t *wgeom, xcb_get_window_at
 
     /* Apply any input shape the client already set before mapping to the
      * frame, so clicks outside the visible area of shaped docks (plank) pass
-     * through right away; later changes arrive via shape notify (event.c). */
+     * through right away; later changes arrive via shape notify (event.c),
+     * and client_geometry_refresh() re-applies the input region after every
+     * geometry change so it never goes stale. */
     if (globalconf.have_input_shape)
     {
         cairo_surface_t *surf = xwindow_get_shape(c->window,

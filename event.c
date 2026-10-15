@@ -957,7 +957,9 @@ event_handle_shape_notify(xcb_shape_notify_event_t *ev)
              * docks (e.g. plank) size their window larger than the visible
              * dock and rely on the input shape to let clicks in the
              * transparent/expanded area fall through.  awesome's frame would
-             * otherwise eat the whole rectangle. */
+             * otherwise eat the whole rectangle.  Normal clients carry no
+             * input shape (their frame input stays the default full window);
+             * shaped docks are the ones that need this propagation. */
             cairo_surface_t *surf = xwindow_get_shape(ev->affected_window,
                                                       XCB_SHAPE_SK_INPUT);
             xwindow_set_shape(c->frame_window,
