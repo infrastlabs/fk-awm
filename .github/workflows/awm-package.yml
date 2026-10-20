@@ -22,7 +22,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # git describe 全历史（§3.6）
+          fetch-depth: 0   # git describe 全历史（§3.6）
+          fetch-tags: true # 显式拉 tag，否则 describe --tags 无基线失败
 
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v2
