@@ -1,0 +1,4 @@
+# buildx context = 项目根；.ws 是构建产物目录（无须进容器/context）
+.github/workflows/.ws/
+.git/worktrees/
+.buildx-ctx/
