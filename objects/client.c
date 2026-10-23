@@ -2023,7 +2023,8 @@ client_geometry_refresh(void)
             cairo_surface_t *surf = xwindow_get_shape(c->window,
                                                       XCB_SHAPE_SK_INPUT);
             xwindow_set_shape(c->frame_window, geometry.width, geometry.height,
-                              XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+                              XCB_SHAPE_SK_INPUT, surf, -c->border_width,
+                              c->titlebar[CLIENT_TITLEBAR_TOP].size);
             if (surf)
                 cairo_surface_destroy(surf);
         }
@@ -2249,7 +2250,8 @@ client_manage(xcb_window_t w, xcb_get_geometry_reply_t *wgeom, xcb_get_window_at
         xwindow_set_shape(c->frame_window,
                           c->geometry.width + c->border_width * 2,
                           c->geometry.height + c->border_width * 2,
-                          XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+                          XCB_SHAPE_SK_INPUT, surf, -c->border_width,
+                          c->titlebar[CLIENT_TITLEBAR_TOP].size);
         if (surf)
             cairo_surface_destroy(surf);
     }
@@ -4286,7 +4288,7 @@ luaA_client_set_shape_bounding(lua_State *L, client_t *c)
     xwindow_set_shape(c->frame_window,
             c->geometry.width + (c->border_width * 2),
             c->geometry.height + (c->border_width * 2),
-            XCB_SHAPE_SK_BOUNDING, surf, -c->border_width);
+            XCB_SHAPE_SK_BOUNDING, surf, -c->border_width, 0);
     luaA_object_emit_signal(L, -3, "property::shape_bounding", 0);
     return 0;
 }
@@ -4335,7 +4337,7 @@ luaA_client_set_shape_clip(lua_State *L, client_t *c)
     if(!lua_isnil(L, -1))
         surf = (cairo_surface_t *)lua_touserdata(L, -1);
     xwindow_set_shape(c->frame_window, c->geometry.width, c->geometry.height,
-            XCB_SHAPE_SK_CLIP, surf, 0);
+            XCB_SHAPE_SK_CLIP, surf, 0, 0);
     luaA_object_emit_signal(L, -3, "property::shape_clip", 0);
     return 0;
 }
@@ -4370,7 +4372,8 @@ luaA_client_set_shape_input(lua_State *L, client_t *c)
     xwindow_set_shape(c->frame_window,
             c->geometry.width + (c->border_width * 2),
             c->geometry.height + (c->border_width * 2),
-            XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+            XCB_SHAPE_SK_INPUT, surf, -c->border_width,
+            c->titlebar[CLIENT_TITLEBAR_TOP].size);
     luaA_object_emit_signal(L, -3, "property::shape_input", 0);
     return 0;
 }

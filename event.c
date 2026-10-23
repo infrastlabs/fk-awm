@@ -965,7 +965,8 @@ event_handle_shape_notify(xcb_shape_notify_event_t *ev)
             xwindow_set_shape(c->frame_window,
                               c->geometry.width + c->border_width * 2,
                               c->geometry.height + c->border_width * 2,
-                              XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+                              XCB_SHAPE_SK_INPUT, surf, -c->border_width,
+                              c->titlebar[CLIENT_TITLEBAR_TOP].size);
             if (surf)
                 cairo_surface_destroy(surf);
             luaA_object_emit_signal(L, -1, "property::shape_client_input", 0);

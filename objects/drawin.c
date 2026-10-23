@@ -678,7 +678,7 @@ luaA_drawin_set_shape_bounding(lua_State *L, drawin_t *drawin)
     xwindow_set_shape(drawin->window,
             drawin->geometry.width + 2*drawin->border_width,
             drawin->geometry.height + 2*drawin->border_width,
-            XCB_SHAPE_SK_BOUNDING, surf, -drawin->border_width);
+            XCB_SHAPE_SK_BOUNDING, surf, -drawin->border_width, 0);
     luaA_object_emit_signal(L, -3, "property::shape_bounding", 0);
     return 0;
 }
@@ -715,7 +715,7 @@ luaA_drawin_set_shape_clip(lua_State *L, drawin_t *drawin)
     drawin_apply_moveresize(drawin);
 
     xwindow_set_shape(drawin->window, drawin->geometry.width, drawin->geometry.height,
-            XCB_SHAPE_SK_CLIP, surf, 0);
+            XCB_SHAPE_SK_CLIP, surf, 0, 0);
     luaA_object_emit_signal(L, -3, "property::shape_clip", 0);
     return 0;
 }
@@ -754,7 +754,7 @@ luaA_drawin_set_shape_input(lua_State *L, drawin_t *drawin)
     xwindow_set_shape(drawin->window,
             drawin->geometry.width + 2*drawin->border_width,
             drawin->geometry.height + 2*drawin->border_width,
-            XCB_SHAPE_SK_INPUT, surf, -drawin->border_width);
+            XCB_SHAPE_SK_INPUT, surf, -drawin->border_width, 0);
     luaA_object_emit_signal(L, -3, "property::shape_input", 0);
     return 0;
 }
