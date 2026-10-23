@@ -273,6 +273,22 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
     xcb_shape_get_rectangles_cookie_t rcookie = xcb_shape_get_rectangles(globalconf.connection, win, kind);
     if (kind == XCB_SHAPE_SK_INPUT)
     {
+        /* Our input shape defaults to our bounding shape. If the window has no
+         * bounding shape at all, its input shape is the default full-window
+         * rectangle — propagating it to the frame is a no-op and only creates
+         * a size mismatch (frame vs client differ by the titlebar height),
+         * leaving the frame's bottom strip without input pixels. Skip such
+         * windows and let the frame keep its default full-rectangle input. */
+        xcb_shape_query_extents_cookie_t ecookie = xcb_shape_query_extents(globalconf.connection, win);
+        xcb_shape_query_extents_reply_t *extents = xcb_shape_query_extents_reply(globalconf.connection, ecookie, NULL);
+        bool shaped = extents && (extents->bounding_shaped || extents->clip_shaped);
+        free(extents);
+        if (!shaped)
+        {
+            xcb_discard_reply(globalconf.connection, rcookie.sequence);
+            return NULL;
+        }
+
         /* We cannot query the size/existence of an input shape... */
         xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(globalconf.connection,
                 xcb_get_geometry(globalconf.connection, win), NULL);
