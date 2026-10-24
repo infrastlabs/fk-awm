@@ -259,32 +259,68 @@ xwindow_set_border_color(xcb_window_t w, color_t *color)
         xcb_change_window_attributes(globalconf.connection, w, XCB_CW_BORDER_PIXEL, &color->pixel);
 }
 
-/* Whether every pixel of an A1 shape surface is set, i.e. whether the shape
- * covers the whole area it describes.
+/* Whether a shape rectangle list covers the given area completely, i.e.
+ * whether a mask built from those rectangles would have every pixel set.
  *
  * Needed for the input-shape case: X does not report whether a window has an
- * input shape at all (see xwindow_get_shape), so "is propagation a no-op?" can
- * only be answered by looking at the shape itself. */
+ * input shape at all (see xwindow_get_shape), so "would propagating this mask
+ * be worth doing?" can only be answered by looking at the shape itself.
+ *
+ * Answered from the rectangles instead of by rasterizing them and reading the
+ * pixels back.  An A1 image surface holds 1 bit per pixel, so its stride is
+ * width/8 bytes, and a byte-wise test over such a surface is off by a factor
+ * of 8.  That is exactly what the previous version of this check did -- it
+ * compared the stride with the width in pixels -- so it reported "not full" for
+ * every surface.  The consequence was that every client's input mask got
+ * propagated onto its frame and every title bar lost its input pixels.
+ *
+ * The rectangles are in window coordinates, i.e. relative to the client-area
+ * top-left corner, which is where the area being covered starts here.  They may
+ * still stick out of it (the whole-window rectangle does, to cover the border)
+ * and are clamped to it. */
 static bool
-xwindow_shape_surface_full(cairo_surface_t *surface, int width, int height)
+xwindow_shape_rects_full(const xcb_rectangle_t *rects, int num_rects,
+                         int width, int height)
 {
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0 || num_rects <= 0)
         return false;
 
-    cairo_surface_flush(surface);
-    const unsigned char *data = cairo_image_surface_get_data(surface);
-    int stride = cairo_image_surface_get_stride(surface);
-    if (!data || stride < width)
-        return false;
+    /* The common case: one rectangle, which is all a server needs for a full
+     * window.  No bitmap, no scan. */
+    if (num_rects == 1)
+        return rects[0].x <= 0 && rects[0].y <= 0 &&
+               rects[0].x + rects[0].width >= width &&
+               rects[0].y + rects[0].height >= height;
 
-    for (int y = 0; y < height; y++)
+    unsigned char *covered = p_new(unsigned char, (size_t)width * height);
+    int total = width * height;
+    int done = 0;
+    for (int i = 0; i < num_rects && done < total; i++)
     {
-        const uint8_t *row = data + y * stride;
-        for (int x = 0; x < width; x++)
-            if ((row[x] & 0x80) == 0)
-                return false;
+        int x0 = rects[i].x, y0 = rects[i].y;
+        int x1 = x0 + rects[i].width, y1 = y0 + rects[i].height;
+        if (x1 <= 0 || y1 <= 0 || x0 >= width || y0 >= height)
+            continue;
+        if (x0 < 0)
+            x0 = 0;
+        if (y0 < 0)
+            y0 = 0;
+        if (x1 > width)
+            x1 = width;
+        if (y1 > height)
+            y1 = height;
+        for (int y = y0; y < y1 && done < total; y++)
+            for (int x = x0; x < x1 && done < total; x++)
+                if (!covered[(size_t)y * width + x])
+                {
+                    covered[(size_t)y * width + x] = 1;
+                    done++;
+                }
     }
-    return true;
+
+    bool full = (done == total);
+    p_delete(&covered);
+    return full;
 }
 
 /** Get one of a window's shapes as a cairo surface */
@@ -312,14 +348,13 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
          * bounding_shaped, so they would be misclassified as shape-less.
          *
          * Propagating is only worth doing when the input shape is a strict
-         * subset of the client area. A window with no input shape reports
-         * the whole window, and copying that to the frame is a no-op that
-         * only creates a size mismatch (frame vs client differ by the
-         * titlebar height), leaving the frame's bottom strip without input
-         * pixels. So decide by the effect instead of by a flag: rasterize
-         * the rectangles (needed anyway) and bail if the client area ends
-         * up fully covered -- the caller's XCB_NONE then restores the
-         * frame's default full-rectangle input. */
+         * subset of the client area.  Otherwise the frame is the loser: the
+         * client-sized mask is painted into the frame-sized one starting
+         * below the title bar, and everything above it is written as "no
+         * input".  So decide by the effect instead of by a flag, from the
+         * rectangle list itself and before rasterizing anything (see below).
+         * A window whose input mask was never set reports its whole window as
+         * one rectangle, i.e. full coverage of the client area, and bails. */
         xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(globalconf.connection,
                 xcb_get_geometry(globalconf.connection, win), NULL);
         if (!geom)
@@ -378,10 +413,33 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
         return cairo_image_surface_create(CAIRO_FORMAT_INVALID, -1, -1);
     }
 
-    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_A1, width, height);
-    cairo_t *cr = cairo_create(surface);
     int num_rects = xcb_shape_get_rectangles_rectangles_length(rects_reply);
     xcb_rectangle_t *rects = xcb_shape_get_rectangles_rectangles(rects_reply);
+
+    if (kind == XCB_SHAPE_SK_INPUT &&
+        (num_rects == 0 || xwindow_shape_rects_full(rects, num_rects, width, height)))
+    {
+        /* Skip the propagation and let the caller leave the frame with its
+         * default full-rectangle input (it passes XCB_NONE then).
+         *
+         * num_rects == 0 means the client set a mask that covers nothing.
+         * Propagating it would hand the frame an empty input mask, i.e. make
+         * the whole frame click-through -- strictly worse than the default.
+         * ShapeQueryExtents has no input_shaped field, so the rectangle count
+         * is the only way to see this.
+         *
+         * Full coverage means the mask already is the client area, and the
+         * propagation would still lose the title bar: the client-sized mask is
+         * painted into the frame-sized one starting below the title bar (the
+         * y_off argument of xwindow_set_shape) and the pixels above it are
+         * written as "no input".  A window whose input mask was never set
+         * lands here -- the server reports its whole window as one rectangle. */
+        free(rects_reply);
+        return NULL;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_A1, width, height);
+    cairo_t *cr = cairo_create(surface);
 
     cairo_surface_set_device_offset(surface, -x, -y);
     cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
@@ -391,16 +449,6 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
     cairo_fill(cr);
 
     cairo_destroy(cr);
-
-    if (kind == XCB_SHAPE_SK_INPUT && xwindow_shape_surface_full(surface, width, height))
-    {
-        /* Input shape covers the whole client area: propagating it to the
-         * frame is a no-op, so let the frame keep its default
-         * full-rectangle input (the caller passes XCB_NONE then). */
-        cairo_surface_destroy(surface);
-        free(rects_reply);
-        return NULL;
-    }
 
     free(rects_reply);
     return surface;
