@@ -259,6 +259,34 @@ xwindow_set_border_color(xcb_window_t w, color_t *color)
         xcb_change_window_attributes(globalconf.connection, w, XCB_CW_BORDER_PIXEL, &color->pixel);
 }
 
+/* Whether every pixel of an A1 shape surface is set, i.e. whether the shape
+ * covers the whole area it describes.
+ *
+ * Needed for the input-shape case: X does not report whether a window has an
+ * input shape at all (see xwindow_get_shape), so "is propagation a no-op?" can
+ * only be answered by looking at the shape itself. */
+static bool
+xwindow_shape_surface_full(cairo_surface_t *surface, int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+
+    cairo_surface_flush(surface);
+    const unsigned char *data = cairo_image_surface_get_data(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+    if (!data || stride < width)
+        return false;
+
+    for (int y = 0; y < height; y++)
+    {
+        const uint8_t *row = data + y * stride;
+        for (int x = 0; x < width; x++)
+            if ((row[x] & 0x80) == 0)
+                return false;
+    }
+    return true;
+}
+
 /** Get one of a window's shapes as a cairo surface */
 cairo_surface_t *
 xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
@@ -273,23 +301,25 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
     xcb_shape_get_rectangles_cookie_t rcookie = xcb_shape_get_rectangles(globalconf.connection, win, kind);
     if (kind == XCB_SHAPE_SK_INPUT)
     {
-        /* Our input shape defaults to our bounding shape. If the window has no
-         * bounding shape at all, its input shape is the default full-window
-         * rectangle — propagating it to the frame is a no-op and only creates
-         * a size mismatch (frame vs client differ by the titlebar height),
-         * leaving the frame's bottom strip without input pixels. Skip such
-         * windows and let the frame keep its default full-rectangle input. */
-        xcb_shape_query_extents_cookie_t ecookie = xcb_shape_query_extents(globalconf.connection, win);
-        xcb_shape_query_extents_reply_t *extents = xcb_shape_query_extents_reply(globalconf.connection, ecookie, NULL);
-        bool shaped = extents && (extents->bounding_shaped || extents->clip_shaped);
-        free(extents);
-        if (!shaped)
-        {
-            xcb_discard_reply(globalconf.connection, rcookie.sequence);
-            return NULL;
-        }
-
-        /* We cannot query the size/existence of an input shape... */
+        /* We cannot query whether a window has an input shape at all: the
+         * X ShapeQueryExtents reply carries no input_shaped field (xcb's
+         * reply struct exposes only bounding_shaped/clip_shaped, and a raw
+         * hex dump of the reply confirms it -- setting INPUT alone leaves
+         * every reply byte unchanged), so no flag answers that question.
+         * Checking bounding_shaped/clip_shaped as a proxy is wrong too:
+         * shaped docks such as plank set only an input shape
+         * (gdk_window_input_shape_combine_region), which never sets
+         * bounding_shaped, so they would be misclassified as shape-less.
+         *
+         * Propagating is only worth doing when the input shape is a strict
+         * subset of the client area. A window with no input shape reports
+         * the whole window, and copying that to the frame is a no-op that
+         * only creates a size mismatch (frame vs client differ by the
+         * titlebar height), leaving the frame's bottom strip without input
+         * pixels. So decide by the effect instead of by a flag: rasterize
+         * the rectangles (needed anyway) and bail if the client area ends
+         * up fully covered -- the caller's XCB_NONE then restores the
+         * frame's default full-rectangle input. */
         xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(globalconf.connection,
                 xcb_get_geometry(globalconf.connection, win), NULL);
         if (!geom)
@@ -302,6 +332,7 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
         y = 0;
         width = geom->width;
         height = geom->height;
+        free(geom);
     }
     else
     {
@@ -360,6 +391,17 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
     cairo_fill(cr);
 
     cairo_destroy(cr);
+
+    if (kind == XCB_SHAPE_SK_INPUT && xwindow_shape_surface_full(surface, width, height))
+    {
+        /* Input shape covers the whole client area: propagating it to the
+         * frame is a no-op, so let the frame keep its default
+         * full-rectangle input (the caller passes XCB_NONE then). */
+        cairo_surface_destroy(surface);
+        free(rects_reply);
+        return NULL;
+    }
+
     free(rects_reply);
     return surface;
 }
