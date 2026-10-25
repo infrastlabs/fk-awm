@@ -727,17 +727,21 @@ variant_from_lua(lua_State *L, int idx)
  * entries become string-keyed tables (Notify's a{sv} hints), scalars become
  * the matching Lua type. `v` inside a variant is unwrapped one level, which
  * is the a{sv} case.
+ *
+ * `g_variant_type_element()` is called ONLY inside the ARRAY branch: it
+ * asserts `type_string[0] == 'a' || type_string[0] == 'm'`, and every
+ * non-array variant reaches here (Notify's `(susssasa{sv}i)` tuple, a `(u)`
+ * pid reply, any `s`/`u`/`i`/`as`/`a{sv}` child).  Fetching the element type
+ * unconditionally made the very first `.value` read abort the whole process
+ * with `GLib:ERROR:gvarianttype.c:g_variant_type_element`.
  */
 static void
 variant_to_lua(lua_State *L, GVariant *v)
 {
-    const GVariantType *el;
-
     if (!v) {
         lua_pushnil(L);
         return;
     }
-    el = g_variant_type_element(g_variant_get_type(v));
     switch (g_variant_classify(v)) {
     case G_VARIANT_CLASS_BOOLEAN:
         lua_pushboolean(L, g_variant_get_boolean(v) ? TRUE : FALSE);
@@ -778,6 +782,9 @@ variant_to_lua(lua_State *L, GVariant *v)
         break;
     }
     case G_VARIANT_CLASS_ARRAY: {
+        /* Here the type is guaranteed to start with 'a', so the assert
+         * inside g_variant_type_element() can not fire. */
+        const GVariantType *el = g_variant_type_element(g_variant_get_type(v));
         guint i, n = g_variant_n_children(v);
         lua_newtable(L);
         for (i = 0; i < n; i++) {
