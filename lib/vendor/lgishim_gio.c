@@ -694,7 +694,7 @@ is_variant_userdata(lua_State *L, int idx)
     for (i = 0; i < 2; i++) {
         luaL_getmetatable(L, names[i]);        /* [.., metatable] */
         if (lua_getmetatable(L, idx)) {        /* [.., metatable, obj_mt] */
-            ok = lua_rawequal(L, -1, -2);
+            ok = ok || lua_rawequal(L, -1, -2);
             lua_pop(L, 1);
         } else {
             lua_pop(L, 1);                     /* getmetatable popped the obj */
