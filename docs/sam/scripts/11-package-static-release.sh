@@ -129,7 +129,11 @@ VERSION=${VERSION:-}
 # 版本号默认 = git describe（v4.3-1849-g3fdacff2 → 4.3-1849）：带子版本号（tag 后提交数），
 # 去掉 v 前缀和 -g<sha> 尾巴（包名后面已有单独 SHA 段）。可被 VERSION 环境变量覆盖。
 if [ -z "$VERSION" ]; then
-    DESCRIBE=$(git -C "$REPO" describe --tags --long 2>/dev/null || echo "4.3-0")
+    # --match 'v*' 必须显式给。仓里还有 t01.1 / t02.2 这类临时 tag，git describe 的
+    # 默认 default 模式按版本序取「最近的祖先 tag」，t02.2 排在 v4.3 之后，不加
+    # --match 就算出 02.2-8 而不是 4.3-1843。对标 awm-package.yml 的
+    # push: tags: ['v*'] —— v 系列才是发布线，临时 tag 不参与版本号。
+    DESCRIBE=$(git -C "$REPO" describe --tags --match 'v*' --long 2>/dev/null || echo "v4.3-0")
     VERSION=${DESCRIBE#v}
     VERSION=${VERSION%-g*}
     [ -n "$VERSION" ] || VERSION="4.3-0"
