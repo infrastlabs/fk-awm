@@ -206,7 +206,15 @@ function notif_methods.Notify(sender, object_path, interface, method, parameters
             args.app_icon = app_icon
         end
 
-        if hints.icon_data or hints.image_data or hints["image-data"] then
+        -- The image payload is a byte array, which `.value` cannot hand back,
+        -- so the icon is read through the 0-based accessor instead.  When the
+        -- binding in use does not provide it, skip the image and still show
+        -- the text: raising here unwound the whole Notify handler and the
+        -- notification never appeared at all.
+        local image_data_present = hints.icon_data or hints.image_data
+            or hints["image-data"]
+        local can_read_image_data = type(parameters.get_child_value) == "function"
+        if image_data_present and can_read_image_data then
             -- Icon data is a bit complex and hence needs special care:
             -- .value breaks with the array of bytes (ay) that we get here.
             -- So, bypass it and look up the needed value differently
