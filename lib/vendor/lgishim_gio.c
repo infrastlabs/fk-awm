@@ -722,7 +722,36 @@ variant_from_lua(lua_State *L, int idx)
 }
 
 /*
+ * Push the bytes of an `ay` variant as a Lua string.
+ *
+ * The glib-2.0 we link against has neither g_variant_get_data_array() nor
+ * g_variant_type_is_byte(), so the payload is read child by child.
+ *
+ * Upstream LGI hands the Lua side a byte buffer for `ay`.  Handing over a
+ * table of numbers instead made image-data payloads (naughty/dbus.lua) dead
+ * on arrival: the rows are concatenated with .. and handed to
+ * ImageSurface.create_for_data(), which needs a string.
+ */
+static void
+variant_bytes_push(lua_State *L, GVariant *v)
+{
+    guint n = g_variant_n_children(v), i;
+    char *buf;
+
+    if (n == 0) {
+        lua_pushlstring(L, "", 0);
+        return;
+    }
+    buf = g_new(char, n);
+    for (i = 0; i < n; i++)
+        buf[i] = (char)g_variant_get_byte(g_variant_get_child_value(v, i));
+    lua_pushlstring(L, buf, n);
+    g_free(buf);
+}
+
+/*
  * g_variant_to_lua(): a variant -> a Lua value. Tuples and non-dict arrays
+
  * become 1-based tables (that is what DBusVariant.value is read as), dict
  * entries become string-keyed tables (Notify's a{sv} hints), scalars become
  * the matching Lua type. `v` inside a variant is unwrapped one level, which
@@ -785,6 +814,12 @@ variant_to_lua(lua_State *L, GVariant *v)
         /* Here the type is guaranteed to start with 'a', so the assert
          * inside g_variant_type_element() can not fire. */
         const GVariantType *el = g_variant_type_element(g_variant_get_type(v));
+        const char *el_s = g_variant_type_peek_string(el);
+
+        if (el_s[0] == 'y' && el_s[1] == '\0') {
+            variant_bytes_push(L, v);
+            break;
+        }
         guint i, n = g_variant_n_children(v);
         lua_newtable(L);
         for (i = 0; i < n; i++) {
@@ -825,6 +860,153 @@ variant_to_lua(lua_State *L, GVariant *v)
         break;
     }
     }
+}
+
+/*
+ * Metatable for the tables built by variant_wrap_push().
+ *
+ * Those tables already hold every child as a normal field, so pairs(), # and
+ * numeric indexing work as they do for upstream LGI variant objects.  The
+ * only thing a plain table can not answer is the 0-based accessor
+ * naughty/dbus.lua reaches for instead of .value once a byte array is in
+ * sight (`icon_data:get_child_value(7 - 1).data`).
+ */
+static int
+variantwrap_get_child_value(lua_State *L)
+{
+    lua_Integer idx;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    idx = luaL_checkinteger(L, 2);
+    if (idx < 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_rawgeti(L, 1, (lua_Integer)(idx + 1));
+    return 1;
+}
+
+/*
+ * `x:pairs()` -- naughty/dbus.lua iterates the Notify hints dict as
+ * `for k, v in parameters:get_child_value(6):pairs() do`.  The tables built
+ * here are real tables, so lua_next already walks them correctly; the
+ * metatable only has to hand back the iterator.
+ */
+static int
+variantwrap_pairs(lua_State *L)
+{
+    lua_pushcfunction(L, (lua_CFunction)lua_next);
+    lua_pushvalue(L, 1);
+    lua_pushnil(L);
+    return 3;
+}
+
+static void
+variantwrap_metatable(lua_State *L)
+{
+    lua_getfield(L, LUA_REGISTRYINDEX, "lgishim.variantwrap_mt");
+    if (lua_istable(L, -1))
+        return;
+    lua_pop(L, 1);
+
+    lua_newtable(L);
+    lua_pushcfunction(L, variantwrap_get_child_value);
+    lua_setfield(L, -2, "get_child_value");
+    lua_pushcfunction(L, variantwrap_pairs);
+    lua_setfield(L, -2, "pairs");
+
+    /* Without __index a plain table never consults this metatable, so
+     * `x:pairs()` / `x:get_child_value(i)` resolve to nil. */
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "__index");
+
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "lgishim.variantwrap_mt");
+}
+
+/*
+ * The converter DBusVariant.get_child_value() must produce.
+ *
+ * naughty/dbus.lua walks the Notify hints dict with pairs(), indexes the
+ * image-data tuple by number, and reads the pixel payload through `.data`.
+ * Every compound value therefore becomes a real table (pairs() / # / numeric
+ * indexing all work on it), `ay` additionally carries `.data` with the bytes.
+ * Scalars come back as native Lua values, same as variant_to_lua().
+ *
+ * Without this function the whole image-data branch raised `attempt to call a
+ * nil value (method 'get_child_value')` and the notification was dropped
+ * before it was ever shown.
+ */
+static void
+variant_wrap_push(lua_State *L, GVariant *v)
+{
+    const GVariantType *t;
+    guint i, n;
+
+    if (!v) {
+        lua_pushnil(L);
+        return;
+    }
+
+    /* a{sv} stores each value as a nested variant: unwrap one level */
+    if (g_variant_classify(v) == G_VARIANT_CLASS_VARIANT)
+        v = g_variant_get_child_value(v, 0);
+
+    t = g_variant_get_type(v);
+    if (!g_variant_type_is_container(t)) {
+        variant_to_lua(L, v);
+        return;
+    }
+
+    if (g_variant_type_is_array(t)) {
+        const GVariantType *el = g_variant_type_element(t);
+
+        if (g_variant_type_is_dict_entry(el)) {
+            n = g_variant_n_children(v);
+            lua_newtable(L);
+            for (i = 0; i < n; i++) {
+                GVariant *entry = g_variant_ref(g_variant_get_child_value(v, i));
+                const char *ks = g_variant_get_string(
+                    g_variant_get_child_value(entry, 0), NULL);
+
+                variant_wrap_push(L, g_variant_get_child_value(entry, 1));
+                lua_pushstring(L, ks ? ks : "");
+                lua_insert(L, -2);
+                lua_rawset(L, -3);
+                g_variant_unref(entry);
+            }
+            goto meta;
+        }
+
+        if (g_variant_type_peek_string(el)[0] == 'y' &&
+            g_variant_type_peek_string(el)[1] == '\0') {
+            lua_newtable(L);
+            variant_bytes_push(L, v);
+            lua_setfield(L, -2, "data");
+
+            /* the byte list as well, so the old table-of-numbers shape is
+             * still there for anyone that indexed it */
+            n = g_variant_n_children(v);
+            for (i = 0; i < n; i++) {
+                lua_pushinteger(L, (lua_Integer)g_variant_get_byte(
+                    g_variant_get_child_value(v, i)));
+                lua_rawseti(L, -2, (lua_Integer)(i + 1));
+            }
+            goto meta;
+        }
+    }
+
+    /* array of scalars, or a tuple */
+    n = g_variant_n_children(v);
+    lua_newtable(L);
+    for (i = 0; i < n; i++) {
+        variant_wrap_push(L, g_variant_get_child_value(v, i));
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+
+meta:
+    variantwrap_metatable(L);
+    lua_setmetatable(L, -2);
 }
 
 static void
@@ -2387,6 +2569,36 @@ dbusvar_n_children(lua_State *L)
     return 1;
 }
 
+/*
+ * `get_child_value(i)`: the 0-based child accessor naughty/dbus.lua switches
+ * to instead of `.value` when the payload holds a byte array (see the comment
+ * above `hints.icon_data` in that file).
+ *
+ * This one method being absent was enough to kill every notification that
+ * carries an image: `parameters:get_child_value(7 - 1)` raised `attempt to
+ * call a nil value`, which unwound the whole Notify handler before the
+ * notification was created.
+ */
+static int
+dbusvar_get_child_value(lua_State *L)
+{
+    GVariant *v = (GVariant *)chk_cls(L, 1, C_DBUSVAR);
+    lua_Integer idx;
+
+    if (!v) {
+        lua_pushnil(L);
+        return 1;
+    }
+    idx = luaL_checkinteger(L, 2);
+    if (idx < 0 || (guint)idx >= g_variant_n_children(v)) {
+        luaL_error(L, "lgishim_gio: DBusVariant.get_child_value: index %d out of range",
+                   (int)idx);
+        return 0;
+    }
+    variant_wrap_push(L, g_variant_get_child_value(v, (guint)idx));
+    return 1;
+}
+
 /* --- DBusMethodInvocation */
 
 static int
@@ -3055,6 +3267,7 @@ static const luaL_Reg DBUSVAR_M[] = {
     { "new",         dbusvar_new },
     { "type_string", dbusvar_type_string },
     { "n_children",  dbusvar_n_children },
+    { "get_child_value", dbusvar_get_child_value },
     { NULL, NULL },
 };
 
