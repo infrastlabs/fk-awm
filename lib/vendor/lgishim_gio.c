@@ -743,8 +743,11 @@ variant_bytes_push(lua_State *L, GVariant *v)
         return;
     }
     buf = g_new(char, n);
-    for (i = 0; i < n; i++)
-        buf[i] = (char)g_variant_get_byte(g_variant_get_child_value(v, i));
+    for (i = 0; i < n; i++) {
+        GVariant *byte = g_variant_get_child_value(v, i);
+        buf[i] = (char)g_variant_get_byte(byte);
+        g_variant_unref(byte);
+    }
     lua_pushlstring(L, buf, n);
     g_free(buf);
 }
@@ -805,7 +808,7 @@ variant_to_lua(lua_State *L, GVariant *v)
         break;
     }
     case G_VARIANT_CLASS_VARIANT: {
-        GVariant *inner = g_variant_ref(g_variant_get_child_value(v, 0));
+        GVariant *inner = g_variant_get_child_value(v, 0);
         variant_to_lua(L, inner);
         g_variant_unref(inner);
         break;
@@ -823,10 +826,10 @@ variant_to_lua(lua_State *L, GVariant *v)
         guint i, n = g_variant_n_children(v);
         lua_newtable(L);
         for (i = 0; i < n; i++) {
-            GVariant *child = g_variant_ref(g_variant_get_child_value(v, i));
+            GVariant *child = g_variant_get_child_value(v, i);
             if (g_variant_type_is_dict_entry(el)) {
-                GVariant *key = g_variant_ref(g_variant_get_child_value(child, 0));
-                GVariant *val = g_variant_ref(g_variant_get_child_value(child, 1));
+                GVariant *key = g_variant_get_child_value(child, 0);
+                GVariant *val = g_variant_get_child_value(child, 1);
                 const char *ks = g_variant_get_string(key, NULL);
                 variant_to_lua(L, val);
                 lua_pushstring(L, ks ? ks : "");
@@ -846,7 +849,7 @@ variant_to_lua(lua_State *L, GVariant *v)
         guint i, n = g_variant_n_children(v);
         lua_newtable(L);
         for (i = 0; i < n; i++) {
-            GVariant *child = g_variant_ref(g_variant_get_child_value(v, i));
+            GVariant *child = g_variant_get_child_value(v, i);
             variant_to_lua(L, child);
             lua_rawseti(L, -2, (lua_Integer)(i + 1));
             g_variant_unref(child);
@@ -889,13 +892,22 @@ variantwrap_get_child_value(lua_State *L)
 /*
  * `x:pairs()` -- naughty/dbus.lua iterates the Notify hints dict as
  * `for k, v in parameters:get_child_value(6):pairs() do`.  The tables built
- * here are real tables, so lua_next already walks them correctly; the
- * metatable only has to hand back the iterator.
+ * here are real tables, so the library next() walks them; the metatable only
+ * has to hand back the iterator.
+ *
+ * lua_next() must NOT be pushed here.  It is the C API form and takes the
+ * table's stack index as its second argument, but Lua invokes a for-loop
+ * iterator as f(L, nargs): with two arguments it would dereference the
+ * control key instead of the table, which reads past the top of the stack.
+ * Depending on the contents of that slot it raised "invalid key to 'next'",
+ * and with a fresh layout it was a plain SIGSEGV -- the crash that took
+ * awesome down on every image notification.  The library next() is a
+ * separate wrapper that reads the table from the stack itself.
  */
 static int
 variantwrap_pairs(lua_State *L)
 {
-    lua_pushcfunction(L, (lua_CFunction)lua_next);
+    lua_getglobal(L, "next");
     lua_pushvalue(L, 1);
     lua_pushnil(L);
     return 3;
@@ -940,21 +952,33 @@ variantwrap_metatable(lua_State *L)
 static void
 variant_wrap_push(lua_State *L, GVariant *v)
 {
+    GVariant *val = v ? g_variant_ref(v) : NULL;
     const GVariantType *t;
     guint i, n;
 
-    if (!v) {
+    /* Owns exactly one reference to the variant it is handed: it either frees
+     * it itself or transfers it through the a{sv} unwrap below.  Every
+     * g_variant_get_child_value() call below therefore creates a reference
+     * that must either be dropped or handed straight to a recursive
+     * variant_wrap_push(), which takes it over.  Dropping the extra ref here
+     * leaked one GVariant per child, which is a hundred per image payload. */
+    if (!val) {
         lua_pushnil(L);
         return;
     }
 
     /* a{sv} stores each value as a nested variant: unwrap one level */
-    if (g_variant_classify(v) == G_VARIANT_CLASS_VARIANT)
-        v = g_variant_get_child_value(v, 0);
+    if (g_variant_classify(val) == G_VARIANT_CLASS_VARIANT) {
+        GVariant *inner = g_variant_get_child_value(val, 0);
 
-    t = g_variant_get_type(v);
+        g_variant_unref(val);
+        val = inner;
+    }
+
+    t = g_variant_get_type(val);
     if (!g_variant_type_is_container(t)) {
-        variant_to_lua(L, v);
+        variant_to_lua(L, val);
+        g_variant_unref(val);
         return;
     }
 
@@ -962,17 +986,18 @@ variant_wrap_push(lua_State *L, GVariant *v)
         const GVariantType *el = g_variant_type_element(t);
 
         if (g_variant_type_is_dict_entry(el)) {
-            n = g_variant_n_children(v);
+            n = g_variant_n_children(val);
             lua_newtable(L);
             for (i = 0; i < n; i++) {
-                GVariant *entry = g_variant_ref(g_variant_get_child_value(v, i));
-                const char *ks = g_variant_get_string(
-                    g_variant_get_child_value(entry, 0), NULL);
+                GVariant *entry = g_variant_get_child_value(val, i);
+                GVariant *key = g_variant_get_child_value(entry, 0);
+                const char *ks = g_variant_get_string(key, NULL);
 
                 variant_wrap_push(L, g_variant_get_child_value(entry, 1));
                 lua_pushstring(L, ks ? ks : "");
                 lua_insert(L, -2);
                 lua_rawset(L, -3);
+                g_variant_unref(key);
                 g_variant_unref(entry);
             }
             goto meta;
@@ -981,15 +1006,17 @@ variant_wrap_push(lua_State *L, GVariant *v)
         if (g_variant_type_peek_string(el)[0] == 'y' &&
             g_variant_type_peek_string(el)[1] == '\0') {
             lua_newtable(L);
-            variant_bytes_push(L, v);
+            variant_bytes_push(L, val);
             lua_setfield(L, -2, "data");
 
             /* the byte list as well, so the old table-of-numbers shape is
              * still there for anyone that indexed it */
-            n = g_variant_n_children(v);
+            n = g_variant_n_children(val);
             for (i = 0; i < n; i++) {
-                lua_pushinteger(L, (lua_Integer)g_variant_get_byte(
-                    g_variant_get_child_value(v, i)));
+                GVariant *byte = g_variant_get_child_value(val, i);
+
+                lua_pushinteger(L, (lua_Integer)g_variant_get_byte(byte));
+                g_variant_unref(byte);
                 lua_rawseti(L, -2, (lua_Integer)(i + 1));
             }
             goto meta;
@@ -997,14 +1024,15 @@ variant_wrap_push(lua_State *L, GVariant *v)
     }
 
     /* array of scalars, or a tuple */
-    n = g_variant_n_children(v);
+    n = g_variant_n_children(val);
     lua_newtable(L);
     for (i = 0; i < n; i++) {
-        variant_wrap_push(L, g_variant_get_child_value(v, i));
+        variant_wrap_push(L, g_variant_get_child_value(val, i));
         lua_rawseti(L, -2, (lua_Integer)(i + 1));
     }
 
 meta:
+    g_variant_unref(val);
     variantwrap_metatable(L);
     lua_setmetatable(L, -2);
 }
