@@ -19,6 +19,7 @@ local screen  = require("awful.screen")
 local gtable  = require("gears.table")
 local gobject = require("gears.object")
 local gsurface = require("gears.surface")
+local menubarutils = require("menubar.utils")
 
 local naughty = {}
 
@@ -859,12 +860,29 @@ function naughty.icon_clear_handler(self, context, hints) --luacheck: no unused 
     self:emit_signal("property::icon")
 end
 
+--- Request handler to get the icon using the XDG icon name.
+-- @signalhandler naughty.app_icon_handler
+function naughty.app_icon_handler(self, context, hints)
+    if context ~= "app_icon" then return end
+
+    local name = hints.app_icon
+    if not name then return end
+
+    local path = menubarutils.lookup_icon(name)
+        or menubarutils.lookup_icon(name:lower())
+
+    if not path then return end
+
+    self._private.icon = gsurface.load_uncached_silently(path)
+end
+
 naughty.connect_signal("property::screen"  , update_index)
 naughty.connect_signal("property::position", update_index)
 
 naughty.connect_signal("request::icon", naughty.client_icon_handler)
 naughty.connect_signal("request::icon", naughty.icon_path_handler  )
 naughty.connect_signal("request::icon", naughty.icon_clear_handler )
+naughty.connect_signal("request::icon", naughty.app_icon_handler   )
 
 --@DOC_signals_COMMON@
 
