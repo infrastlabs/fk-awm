@@ -11,10 +11,14 @@
 #   4 upx         UPX 7 轮阶梯压缩，取最小
 #   5 install     复用 CMake install 规则装到 prefix + 校验安装树
 #   6 smoke       UPX 后实跑安装产物（Xvnc + 默认 rc.lua）
-#   7 package     写 README + tar.gz + sha256 + 解包校验
+#   7 package     写 README + tar.gz + 解包校验（校验和写进 .log，不另留 .sha256）
 #
 # 产物：
 #   /_ext/tmp/awe-package/awm-static-musl-<yymmdd-HHmmss>-v<ver>-<sha7>.tar.gz
+#   /_ext/tmp/awe-package/awm-static-musl-<yymmdd-HHmmss>-v<ver>-<sha7>.log
+#   只留这两个。包校验和写在 .log 末尾「tar.gz sha256」段（不另出 .sha256 文件），
+#   中间暂存目录 $PKGNAME-root 出包后自动删除。
+#
 #   时间戳为出包当时的东八区时间，每次运行现取
 #   ver 默认取 git describe（如 4.3-1849，即 v4.3 tag 后的提交数）
 #   包内即全路径 usr/local/static/awm/...，所以 tar -C / 一步装好。
@@ -569,7 +573,8 @@ EOF
     cp -a "$PREFIX/." "$TAR_ROOT/$PREFIX_REL/"
     TARBALL="$OUT_DIR/$PKGNAME.tar.gz"
     run "tar czf" tar -czf "$TARBALL" -C "$TAR_ROOT" usr
-    sha256sum "$TARBALL" > "$TARBALL.sha256"
+    TB_SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+    rm -rf "$TAR_ROOT"
 
     # 解包校验：包能不能装回来
     XDIR=$(mktemp -d /_ext/tmp/tarball-check.XXXXXX)
@@ -587,7 +592,7 @@ EOF
 ==================================================================
  出包完成
    包    : $TARBALL  ($TB bytes)
-   sha256: $(cut -d' ' -f1 "$TARBALL.sha256")
+   sha256: $TB_SHA
    大小  : 二进制 $BEFORE -> $AFTER bytes，包 $TB bytes（相对原二进制 $PCT%↓）
    安装  : tar -xzf $PKGNAME.tar.gz -C /
    启动  : $PREFIX/bin/awesome
@@ -595,6 +600,8 @@ EOF
 ==================================================================
 EOF
     say "出包完成：$TARBALL"
+    # 校验和留档在 .log 里（不再另出 .sha256 文件），格式与 sha256sum 输出一致
+    printf '\n==> tar.gz sha256\n    %s  %s\n' "$TB_SHA" "$TARBALL" >>"$LOGF"
     chown -R 1000:1000 "$OUT_DIR" 2>/dev/null || true
 }
 
